@@ -1,0 +1,286 @@
+---
+title: "IBD"
+output: html_document
+---
+#### this is mostly from Bob's code that he sent me to filter and then do some IBS/IBD analysis, the PCA and TAN graph at the bottom is code I made
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "../../")
+```
+
+
+```{r}
+getwd()
+# load packages 
+library(tidyverse)
+library(vcfR)
+library(MIPanalyzer)
+library(devtools)
+library(raster)
+library(viridisLite)
+library(ggplot2)
+library(gridExtra)
+library(sf)
+# set seed
+set.seed(1)
+```
+
+```{r, get biallelic file}
+vcf <- read.vcfR("data/vcf/variants_filtered.vcf.gz", verbose = FALSE)
+
+# subset to biallelic sites
+vcf<- vcf[is.biallelic(vcf),]
+
+# convert to mipanalyzer_biallelic format
+data_raw <- vcf2mipanalyzer_biallelic(vcfR = vcf)
+
+# get numeric chromosome for convenience
+data_raw$loci$CHROM_NUMERIC <- as.numeric(substr(data_raw$loci$CHROM, 4, nchar(as.character(data_raw$loci$CHROM))))
+
+# save to file
+saveRDS(data_raw, file = "R/MIPAnalyzer/biallelic_raw.rds")
+```
+
+```{r}
+dat <- readRDS("R/MIPAnalyzer/biallelic_raw.rds")
+dat
+```
+
+```{r}
+# split sample ID into separate elements
+ID_split <- t(mapply(function(x) {
+  s <- strsplit(x, "-")[[1]]
+  ls <- length(s)
+  c(paste0(s[1:(ls-2)], collapse = "-"), s[ls-1], s[ls])
+}, dat$samples$SAMPLE_ID))
+
+# format ID_split as dataframe
+ID_split <- data.frame(ID_split, stringsAsFactors = FALSE)
+names(ID_split) <- c("ID", "Probe_Set", "REP")
+ID_split$REP <- as.numeric(ID_split$REP)
+
+# replace sample info with split version
+dat$samples <- ID_split
+
+# drop misc bad samples
+dat <- filter_samples(x = dat,
+                      sample_filter = !(dat$samples$ID %in% c("HC","3D7", "7G8", "LC", "NTC","HB3", "DD2", "V1S","LC", "HC", "NTC", "NTP")), 
+                      description = "drop control samples based on ID")
+dat <- filter_samples(x = dat,
+                      sample_filter = !(dat$samples$Probe_Set %in% c("CTL")),
+                      description = "drop control samples based on Probe_Set")
+
+# lost 5 samples as they did not have data:FP25616,MqTZ0477,RPM36,YB5034,YB5052
+
+# Add Metadata
+metadata<-read_tsv("data/metadata/tanzania_sample_meta_edited_V3.tsv")
+# Change titles to underscore
+colnames(metadata) <- gsub(' ','_',colnames(metadata))
+names(metadata)[30] <- "sample_ID"
+# removed rows withs NA in sample_ID
+metadata <- metadata %>% drop_na(sample_ID)
+
+# drop samples not found in metadata
+dat <- filter_samples(x = dat,
+                      sample_filter = dat$samples$ID %in% metadata$`sample_ID`,
+                      description = "drop samples not found in metadata file")
+
+# merge some metadata columns
+w <- match(dat$samples$ID, metadata$`sample_ID`)
+dat$samples <- cbind(dat$samples, metadata[w,c('sample_ID','Sample_Set','Shehia','Study_Site','longitude','latitude')])
+```
+
+## Apply coverage filters
+
+Filter out "overcounts", defined as barcode count > coverage (intended to filter out multi-mappers). These elements are replaced with `NA`.
+
+
+```{r}
+# filter overcounts
+dat <- filter_overcounts(dat)
+```
+
+Filter out alleles with fewer than 2 barcodes
+
+```{r}
+# filter out alleles with fewer than 2 barcodes
+dat <- filter_counts(dat, count_min = 2)
+```
+
+Filter out alleles with WSAF lower than 1%
+
+```{r}
+# filter out alleles with WSAF lower than a given threshold
+dat <- filter_wsaf(dat, wsaf_min = 0.01)
+```
+
+Filter out invariant loci, which may have been produced by previous two steps:
+```{r}
+# filter out invariant loci
+dat <- filter_loci_invariant(dat)
+```
+
+Before filtering based on coverage, we can explore how many samples would be dropped for a given set of thresholds:
+
+```{r, fig.width=10, fig.height=6}
+# explore coverage per sample
+plot_list <- list()
+min_coverage <- c(1,5,10,20,50,100)
+for (i in 1:length(min_coverage)) {
+  plot_list[[i]] <- explore_filter_coverage_samples(dat, min_coverage = min_coverage[i], max_low_coverage = 50)
+}
+grid.arrange(grobs = plot_list, nrow = 2)
+```
+
+Our aim is to strike a balance between throwing out samples, and retaining poor quality samples.
+
+```{r}
+# filter samples based on chosen threshold
+#dat <- filter_coverage_samples(dat, min_coverage = 10, max_low_coverage = 50, replace_low_coverage = TRUE)
+```
+
+Similarly, we can filter loci to remove those with large numbers of missing samples:
+
+```{r, fig.width=10, fig.height=6}
+# explore coverage per locus
+plot_list <- list()
+for (i in 1:length(min_coverage)) {
+  plot_list[[i]] <- explore_filter_coverage_loci(dat, min_coverage = min_coverage[i], max_low_coverage = 50)
+}
+grid.arrange(grobs = plot_list, nrow = 2)
+```
+
+```{r}
+# filter loci based on chosen threshold
+#dat <- filter_coverage_loci(dat, min_coverage = 1, max_low_coverage = 50, replace_low_coverage = TRUE)
+```
+
+Every filter applied to the data is stored in the filter history, giving us a record of how the data has changed:
+ 
+```{r}
+dat
+dat$filter_history[,1:5]
+```
+
+Finally, we can save the filtered data to file:
+
+```{r}
+# save data to file
+saveRDS(dat, file = "R/MIPAnalyzer/biallelic_processed.rds")
+
+write.csv(dat$samples, "R/MIPAnalyzer/nondr_postcoveragefilter.csv", row.names = FALSE)
+```
+
+```{r}
+# add distance element for storing results
+dat$distance <- list()
+```
+
+### IBS distance
+
+* Proportion of sites that are identical by state (IBS), ignoring heterozygous sites
+
+```{r, fig.height=6, fig.width=7}
+# calculate and store IBS distance
+dist_IBS <- get_IBS_distance(dat, ignore_het = TRUE, report_progress = FALSE)
+dat$distance$IBS <- dist_IBS
+
+# plot distance matrix
+plot(raster(dist_IBS), col = plasma(100), axes = FALSE, box = FALSE)
+```
+
+* Proportion of sites that are identical by state (IBS), rounding heterozygous sites to the dominant strain
+
+```{r, fig.height=6, fig.width=7}
+# calculate and store IBS distance
+dist_IBS_dominant <- get_IBS_distance(dat, ignore_het = FALSE, report_progress = FALSE)
+dat$distance$IBS_dominant <- dist_IBS_dominant
+
+# plot distance matrix
+plot(raster(dist_IBS_dominant), col = plasma(100), axes = FALSE, box = FALSE)
+```
+### Maximum likelihood inbreeding coefficient distance
+
+* MLE of inbreeding coeffient (F), ignoring heterozygous sites
+
+```{r, fig.height=6, fig.width=7}
+# calculate and store F distance
+dist_inbreeding <- inbreeding_mle(dat, f = seq(0,1,l=51),
+                                  ignore_het = TRUE, report_progress = FALSE)
+dat$distance$inbreeding <- dist_inbreeding$mle
+
+# plot distance matrix
+plot(raster(dist_inbreeding$mle), col = plasma(100), axes = FALSE, box = FALSE)
+
+# histogram of maximum distance per sample
+d <- dist_inbreeding$mle
+d[is.na(d)] <- 0
+d <- d + t(d)
+max_dist <- apply(d, 1, max)
+hist(max_dist, breaks = seq(0,1,0.05), col = 8)
+```
+
+* MLE of inbreeding coeffient (F), rounding heterozygous sites to the dominant strain
+
+```{r, fig.height=6, fig.width=7}
+# calculate and store F distance
+dist_inbreeding_dominant <- inbreeding_mle(dat, f = seq(0,1,l=51),
+                                  ignore_het = FALSE, report_progress = FALSE)
+dat$distance$inbreeding_dominant <- dist_inbreeding_dominant$mle
+
+# plot distance matrix
+plot(raster(dist_inbreeding_dominant$mle), col = plasma(100), axes = FALSE, box = FALSE)
+
+# histogram of maximum distance per sample
+d <- dist_inbreeding_dominant$mle
+d[is.na(d)] <- 0
+d <- d + t(d)
+max_dist <- apply(d, 1, max)
+hist(max_dist, breaks = seq(0,1,0.05), col = 8)
+```
+
+* PCA 
+```{r}
+wsaf <- get_wsaf(dat)
+pca <- pca_wsaf(wsaf)
+
+plot_pca_variance(pca)
+
+plot_pca_contribution(pca, 2, chrom = as.numeric(substr(dat$loci$CHROM, 4, 5)), pos = dat$loci$POS)
+
+#plot_pca(pca, ggplot = TRUE)
+pca$Sample_Set <- dat$samples$Sample_Set
+
+b <- ggplot(as.data.frame(pca$x), aes(x = PC1, y = PC2, fill = pca$Sample_Set)) + geom_point(size=2, shape=21, alpha=.8)
+b <- b + scale_fill_manual(values = c("red", "blue","green","orange"))
+b <- b + theme_bw() + theme(axis.title = element_text(size = 20, face = "bold"),
+        axis.text.x  = element_text(size=18),
+        legend.title=element_text(size = 18, face = "bold"), legend.text = element_text(size = 14),
+        strip.text = element_text(size=16,face="bold"))+ labs(fill="Region")
+b + xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + ylab(paste0("PC2 (", signif(pca$var[2], 3), "%)"))
+
+ggsave('analysis/PCA.png',device = png)
+```
+#### Make geographic map
+
+```{r}
+# Read in Tanzania and Zanzibar geographic map
+tanzania_map <- read_sf(dsn = "R/MIPAnalyzer/gadm40_TZA_shp")
+
+# Add location data
+#desired_location_data <- c("sample_ID","Shehia","Sample_Set","Study_Site","longitude","latitude")
+#location_metadata <- metadata[,desired_location_data]
+
+# Plot using metadata coordinates 
+ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.5, 40), ylim = c(-7,-5.5), expand = FALSE) +
+   geom_point(data = dat$samples, aes(x = longitude, y = latitude), size = 2, 
+        shape = 23, fill = "darkred") +
+  theme_bw() #+
+  # When I get back, I will add the coordinates!!
+  #geom_segment()
+
+ggsave('analysis/IBD_geo.png',device = png)
+```
+
