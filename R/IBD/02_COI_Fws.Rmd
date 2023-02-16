@@ -1,0 +1,448 @@
+---
+title: "02_COI_FWS"
+author: "Sean Connelly"
+date: "2023-02-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("../../")) 
+```
+
+```{r}
+getwd()
+# load packages 
+library(tidyverse)
+library(vcfR)
+library(rmaverick)
+library(data.table)
+library(coda)
+library(ggpubr)
+library(ggbeeswarm)
+# set seed
+set.seed(1)
+```
+
+```{r function for nonparametric mean, echo=FALSE}
+nonpara <- function(x,iters,measure) {
+  # make as dataframe
+  final <- matrix(data = NA, nrow = length(unique(x$Sample_Set)), ncol = 4)
+  final <- as.data.frame(final)
+  colnames(final) <- c('Sample_Set','mean','L95','U95')
+  for (i in 1:length(unique(x$Sample_Set))) {
+    subset <- x %>% 
+      filter(Sample_Set == unique(x$Sample_Set)[i])
+    subset_to_samp <- subset[[measure]]
+    nonparam_mean <- rep(NA, iters)
+    for (q in 1:iters) {
+      nonparam_mean[q] <- mean(sample(subset_to_samp, length(subset_to_samp), replace = T)) 
+    }
+    final[i,1] <- unique(x$Sample_Set)[i]
+    mean <- mean(nonparam_mean)
+    final[i,2] <-round(mean,2)
+    nonparamL95 <- quantile(nonparam_mean, probs = 0.025)
+    final[i,3] <- round(nonparamL95,2)
+    nonparamU95 <- quantile(nonparam_mean, probs = 0.975)
+    final[i,4] <- round(nonparamU95,2)
+  }
+  return(final)
+}
+```
+
+```{r}
+extract_sampleID <- function(x) {
+  # split all three by delimiter
+  splt <- str_split_fixed(x,'-',4)
+  # make a dataframe 
+  splt_ID <- as.data.frame(splt) %>% 
+    mutate(ID = if_else(
+      V1 == 'UNC',.[[2]],
+      .[[1]]))
+  return(splt_ID$ID)
+}
+```
+
+##### Import VCF and check filtering parameters ####
+```{r}
+# load VCF
+vcf <- read.vcfR("data/vcf_targeted/variants_filtered.vcf.gz")
+
+# freq
+var_freq <- read_delim("data/vcf/check_filtering/variant_check.frq", delim = "\t",
+                       col_names = c("chr", "pos", "nalleles", "nchr", "a1", "a2"), skip = 1)
+
+# find minor allele 
+var_freq$maf <- var_freq %>%  dplyr::select(a1, a2) %>% apply(1, function(z) min(z))
+minor_check <- sum(var_freq$maf < 0.01, na.rm=TRUE)
+# 0 less than 0.001
+
+# find major allele
+var_freq$major <- var_freq %>%  dplyr::select(a1, a2) %>% apply(1, function(z) max(z))
+major_check <- sum(var_freq$major > 0.99, na.rm=TRUE)
+# 0 less than 0.999
+
+# check missingness per site
+var_miss <- read_delim("data/vcf/check_filtering/variant_check.lmiss", delim = "\t",
+                       col_names = c("chr", "pos", "nchr", "nfiltered", "nmiss", "fmiss"), skip = 1)
+summary(var_miss$fmiss)
+fmiss_threshold <- sum(var_miss$fmiss > .15)
+# 0 more than 15% missingness
+```
+
+##### tidy VCF, add metadata and additional filtering#####
+```{r Supplemental Figure 2A}
+#filter missing samples from vcf 
+calc_loci_missingness_by_smpl <- function(vcfRobject = NULL){
+  gt <- vcfR::extract.gt(vcfRobject, element = "GT")
+  ret <- gt %>% as.data.frame(.) %>%
+    tidyr::gather(., key = "sample", value = "gt") %>%
+    dplyr::group_by(sample) %>%
+    dplyr::summarise(
+      n = n(),
+      misscount = sum(is.na(gt)),
+      missprop = sum(is.na(gt))/n
+    )
+
+  return(ret)
+}
+
+# find missing samples
+miss <- calc_loci_missingness_by_smpl(vcf)
+
+# pull samples that pass missingness filter
+pass_miss <- miss %>% 
+  dplyr::filter(missprop < 0.1) %>% 
+  dplyr::pull("sample")
+
+vcf <- vcf[,c('FORMAT', pass_miss)]
+
+#save vcf file without missingness
+write.vcf(vcf, "data/vcf_targeted/vcf_nomiss.vcf.gz")
+
+# subset to biallelic sites
+vcf<- vcf[is.biallelic(vcf),]
+
+# get genotype data
+gts_chr <- vcfR::extract.gt(vcf, element = "AD", as.numeric = T)
+
+# create cumulative read depth distribution figure
+DP_samples <- vcfR::extract.gt(vcf, element = "DP", as.numeric = T)
+rownames(DP_samples) <- 1:nrow(DP_samples)
+#head(DP_samples)
+
+# max is 19309, min is 1
+pdf("results/DP_performance.pdf", width = 7.83, height = 6.07)
+heatmap.bp(log(DP_samples),
+           clabels = F,
+           rlabels = F,
+           cbarplot = F, 
+           rbarplot = F,
+           legend = TRUE)
+dev.off()
+
+# check VCF for missing data
+vcfR::heatmap.bp(gts_chr)
+# tidy VCF
+# extract information
+loci <- vcf@fix[,1:2] %>% 
+  tibble::as_tibble() %>% 
+  dplyr::mutate(POS = as.numeric(POS),
+                Key = 1:dplyr::n()) %>% 
+  dplyr::select(c("CHROM", "POS", "Key"))
+
+# tidy up the DRC data to long format
+vcf_long <- vcf %>% 
+  vcfR::extract_gt_tidy()
+
+# add sample_ID column
+vcf_long$Indiv <- extract_sampleID(vcf_long$Indiv)
+
+# Add Metadata
+metadata<-read_tsv("data/metadata/TAN_metadata.tsv")
+
+# merge some metadata columns
+w <- match(vcf_long$Indiv, metadata$sample_ID)
+vcf_long <- cbind(vcf_long, metadata[w,c('Sample_Set')])
+
+combined_long <- 
+  # now lets merge the loci information with the individual level information
+  dplyr::full_join(x = loci, y = vcf_long, by  = "Key") %>%
+  # don't need Key anymore
+  dplyr::select(-c("Key"))
+
+# iterate for all possibilities (0/0: reference, 1/1: alternate, 0/1: half alt, half het, ./.: nothing)
+combined_long <- combined_long %>% dplyr::mutate(gt = case_when(gt_GT == "0/0" ~ 0, 
+                                         gt_GT == "0/1" ~ 0.5, 
+                                         gt_GT == "1/1" ~ 1)
+)
+
+# Make a df of all the samples that are fixed or ref
+fix_ref <- combined_long %>% 
+  group_by(CHROM, POS, Sample_Set) %>%
+  dplyr::summarise(fixed =
+    sum(gt == 1,na.rm = TRUE)/sum(!is.na(gt)),
+    ref =
+    sum(gt == 0,na.rm = TRUE)/sum(!is.na(gt))) %>% 
+  dplyr::filter(fixed == 1 | ref == 1)
+```
+
+##### Plot plaf and number of heterozygous sites ####
+```{r}
+# calculate the population level allele frequency
+plaf <- combined_long %>% 
+  dplyr::group_by(CHROM, POS,Sample_Set) %>% 
+  dplyr::summarise(
+    # multiple by 2 to assume diploid genome
+    PLAF = sum(gt * 2, na.rm = T) / (2* sum(!is.na(gt))) 
+  )
+
+# plot plaf
+# vary similarly
+plaf %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Sample_Set, y = PLAF, color = Sample_Set), outlier.shape = NA) +
+  geom_jitter(aes(x = Sample_Set, y = PLAF, color = Sample_Set),
+              alpha = 0.3, size = 0.5) +
+  ylim(-0.05, 1.05) + 
+  theme_linedraw() +
+  theme(legend.position = "none") + 
+  labs(y = "PLAF", x = "Region")
+
+# heterozygous sites
+n_hets <- combined_long %>% 
+  dplyr::group_by(Indiv, Sample_Set) %>% 
+  dplyr::summarise(
+    # multiple by 2 to assume diploid genome
+    n_sites = length(gt),
+    n_hets = sum(gt == 0.5, na.rm=T)
+  )
+
+n_hets %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Sample_Set, y = n_hets, color = Sample_Set), outlier.shape = NA) +
+  geom_jitter(aes(x = Sample_Set, y = n_hets, color = Sample_Set),
+              alpha = 0.3,size = 0.5) +
+  theme_linedraw() +
+  theme(legend.position = "none") + 
+  labs(y = "No. Heterozygous SNPs", x = "Region") 
+```
+##### Calculate COI ####
+```{r}
+library(McCOILR)
+# Run THEREALMCcCOIL
+# wide format 
+combined_RMCL <- combined_long %>% 
+  dplyr::mutate(loci = paste(CHROM, POS, sep = "|")) %>% 
+  dplyr::select(c("loci", "Indiv", "gt")) %>% 
+  # liftover missing for RMCL 
+  dplyr::mutate(gt = ifelse(is.na(gt), -1, gt)) %>% 
+  tidyr::pivot_wider(names_from = "Indiv",
+                     values_from = "gt")
+
+smpls <- colnames(vcf@gt)[2:ncol(vcf@gt)]
+smpl_ID <- as.data.frame(stringr::str_split_fixed(smpls,'-',3))
+smpls <- as.character(smpl_ID$V1)
+RMCL <- combined_RMCL[,c("loci", smpls)]
+
+RMCLmat <- as.matrix(RMCL[2:ncol(as.matrix(RMCL))])
+rownames(RMCLmat) <- RMCL[["loci"]]
+RMCLmat <- t(RMCLmat)
+
+# path= "R/RMaverick/THEREALMcCOIL/categorical_method/" ##enter your path here
+# setwd(path)
+# source("McCOIL_categorical.R")
+# getwd()
+
+# # I had to run this part on the cluster
+# McCOILR::McCOIL_categorical(RMCLmat,
+#                    maxCOI=25, threshold_ind=20,
+#                    threshold_site=20,
+#                    totalrun=1000, burnin=100, M0=15,
+#                    e1=0.05, e2=0.05,
+#                    err_method=3, 
+#                    path="results/cat_output1",
+#                    output="output_COI.txt")
+
+# Load summary data
+COI <- read.table("results/cat_output1/output_COI.txt_summary.txt", sep="\t", header=TRUE) %>% 
+  # Subset to COI results
+  dplyr::filter(CorP == "C") %>%  # subset to COI information
+  # select to rows we care about
+  dplyr::select(-c("file", "CorP")) %>% 
+  dplyr::rename(Indiv = name)
+
+w <- match(COI$Indiv, metadata$sample_ID)
+COI <- cbind(COI, metadata[w,c('Sample_Set')])
+```
+
+#### Plot COI ####
+```{r}
+# define colors
+col_Main <- c("#2538be","#9ecae1")
+col_Zan <- c("#Bb141d","#fc9272")
+
+# COI beeswarm plot
+
+#### nonparametric bootstrap, subset by clinical status and compared to mean ####
+nonpara_sum_COI <- nonpara(COI,1e5,measure = 'mean')
+
+means <- COI %>% 
+  group_by(Sample_Set) %>% 
+  summarise_at(vars(mean), ~ mean(.x, na.rm = TRUE))
+
+compareCOI_MAIN <- COI %>% 
+  group_by(Sample_Set) %>%  
+  filter(str_detect(Sample_Set, "MAIN"))
+
+res_MAIN_COI <- wilcox.test(mean ~ Sample_Set,
+                   data = compareCOI_MAIN,
+                   exact = FALSE)
+
+compareCOI_ZAN <- COI %>% 
+  group_by(Sample_Set) %>%  
+  filter(str_detect(Sample_Set, "ZAN"))
+
+res_ZAN_COI <- wilcox.test(mean ~ Sample_Set,
+                   data = compareCOI_ZAN,
+                   exact = FALSE)
+
+#### beeswarm ####
+
+COI_bee <- ggplot(COI, aes(x = Sample_Set, y = mean, color = Sample_Set)) +
+  geom_beeswarm(pch=19, cex=0.3, show.legend = FALSE) +
+  geom_point(data = nonpara_sum_COI, 
+             aes(x = Sample_Set,y = mean), 
+             color = "black",
+             size = 6) +
+  geom_errorbar(data = nonpara_sum_COI, aes(x = Sample_Set, ymin=L95, ymax=U95), 
+                width=0.8, 
+                color = "black",
+                linewidth = 2) +
+  scale_color_manual(values = c(col_Main,col_Zan)) +
+  labs(y = "COI",
+       tag = "A") +
+  theme_linedraw() +
+  scale_y_continuous(breaks=seq(1,8,1), limits = c(1,8)) +
+  theme(axis.text = element_text(size = 25),
+        axis.title = element_text(size = 35),
+        axis.title.x =  element_blank(),
+        plot.tag = element_text(size = 35),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+
+COI_bee
+ggsave("/Users/seanconnelly/Library/CloudStorage/OneDrive-UniversityofNorthCarolinaatChapelHill/UNC/Rotation_Jon/TAN_IBC_analysis_final_V4/results/COI_bee.pdf", device = pdf)
+
+# only monoclonals
+monoclonal <- subset(COI, COI$mean == 1)
+```
+
+##### Compute Fws ####
+```{r}
+# extract GT information and get WSAF for every sample at each loci
+combined_long <- combined_long %>% 
+  # lets make some new variables
+  dplyr::mutate(
+    rad = purrr::map_dbl(gt_AD, function(x){vcfR::masplit(
+      as.matrix(x), record = 1, sort = FALSE, decreasing = FALSE)}),
+    # get alternate allele depth 
+    aad = purrr::map_dbl(gt_AD, function(x){vcfR::masplit(
+      as.matrix(x), record = 2, sort = FALSE, decreasing = FALSE)}),
+    # calculate within-sample reference allele freq
+    wsaf = aad/(rad + aad),
+    wsaf = ifelse(is.nan(wsaf), NA, wsaf) # occurs when 0/0
+  ) %>% 
+  # now let's select the variables that we want
+  dplyr::select(c("CHROM", "POS", "Indiv", "gt", "Sample_Set", "wsaf"))
+
+# calculate heterozygosities
+calc_biallelic_heterozygosity <- function(p_alt) {
+  return (2 * p_alt * (1 - p_alt))
+}
+
+plaf <- plaf %>% 
+  dplyr::mutate(
+    het_plaf = purrr::map_dbl(PLAF, calc_biallelic_heterozygosity)
+  )
+
+combined_long <- combined_long %>% 
+  # lets make some new variables
+  dplyr::mutate(
+    het_wsaf = calc_biallelic_heterozygosity(wsaf)
+  )
+
+combined_long_fws <-
+  dplyr::full_join(combined_long, plaf, by = c("CHROM", "POS", "Sample_Set")) %>%
+  anti_join(fix_ref, by = c("CHROM", "POS","Sample_Set")) %>% 
+  ungroup() %>% 
+  dplyr::mutate(Fwsloci = het_wsaf / het_plaf) %>% 
+  dplyr::group_by(Sample_Set, Indiv) %>% 
+  dplyr::summarise(
+    fws = mean( 1 - (het_wsaf / het_plaf), na.rm = T)
+    )
+```
+#### Calculate and Plot Fws ####
+```{r}
+#### Fws and grid ####
+#### nonparametric bootstrap, subset by clinical status and compared to mean ####
+nonpara_sum_Fws <- as.data.frame(nonpara(combined_long_fws,1e5,measure = 'fws'))
+
+means_Fws <- combined_long_fws %>% 
+  group_by(Sample_Set) %>% 
+  summarise_at(vars(fws), ~ mean(.x, na.rm = TRUE))
+
+compareFws_MAIN <- combined_long_fws %>% 
+  group_by(Sample_Set) %>%  
+  filter(str_detect(Sample_Set, "MAIN"))
+
+res_MAIN_Fws <- wilcox.test(fws ~ Sample_Set,
+                   data = compareFws_MAIN,
+                   exact = FALSE)
+
+compareFws_ZAN <- combined_long_fws %>% 
+  group_by(Sample_Set) %>%  
+  filter(str_detect(Sample_Set, "ZAN"))
+
+res_ZAN_COI <- wilcox.test(fws ~ Sample_Set,
+                   data = compareFws_ZAN,
+                   exact = FALSE)
+
+Fws_bee <- ggplot(combined_long_fws, aes(x = Sample_Set, y = fws, color = Sample_Set)) +
+  geom_beeswarm(pch=19, cex=0.3, show.legend = FALSE) +
+  geom_point(data = nonpara_sum_Fws, 
+             aes(x = Sample_Set,y = mean), 
+             color = "black",
+             size = 6) +
+  geom_errorbar(data = nonpara_sum_Fws, 
+                aes(x = Sample_Set, 
+                    ymin=L95, ymax=U95), 
+                width=.3, 
+                color = "black",
+                linewidth = 2,
+                inherit.aes = FALSE) +
+  scale_color_manual(values = c(col_Main,col_Zan)) +
+  labs(x = "Region", 
+       y = "Fws",
+       tag = "B") +
+  theme_linedraw() +
+  scale_y_continuous(breaks=seq(0,1,0.1), limits = c(0,1)) +
+  theme(#text=element_text(family="sans"),
+        axis.text = element_text(size = 25),
+        axis.title = element_text(size = 35),
+        axis.title.x =  element_blank(),
+        plot.tag = element_text(size = 35),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank())
+
+Fws_bee
+ggsave("/Users/seanconnelly/Library/CloudStorage/OneDrive-UniversityofNorthCarolinaatChapelHill/UNC/Rotation_Jon/TAN_IBC_analysis_final_V4/results/Fws_beeswarm.pdf", device = pdf)
+```
+
+```{r Figure 5}
+# Plot both COI and Fws
+cowplot::plot_grid(COI_bee,Fws_bee)
+
+ggsave("results/Fws_COI.pdf",device = pdf,width = 16, height = 10, units = 'in')
+```
+

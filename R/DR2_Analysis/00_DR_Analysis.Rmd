@@ -1,0 +1,359 @@
+---
+title: "OO_DR2_Analysis"
+author: "Sean Connelly"
+date: "2023-02-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("../../"))
+```
+
+```{r}
+getwd()
+# load packages 
+library(miplicorn)
+library(knitr)
+library(kableExtra)
+library(readr)
+library(tidyverse)
+library(tidyr)
+library(gt)
+library(webshot2)
+library(writexl)
+library(cowplot)
+# set seed
+set.seed(1)
+```
+
+```{r}
+extract_sampleID <- function(x) {
+  # split all three by delimiter
+  splt <- str_split_fixed(x,'-',4)
+  # make a dataframe 
+  splt_ID <- as.data.frame(splt) %>% 
+    mutate(ID = if_else(
+      V1 == 'UNC',.[[2]],
+      .[[1]]))
+  return(splt_ID$ID)
+}
+```
+
+
+```{r function for nonparametric mean, echo=FALSE}
+nonpara <- function(x,iters) {
+  # make as dataframe
+  final <- matrix(data = NA, nrow = 1, ncol = 3)
+  final <- as.data.frame(final)
+  colnames(final) <- c('mean','L95','U95')
+  nonparam_mean <- rep(NA, iters)
+  for (q in 1:iters) {
+    nonparam_mean[q] <- mean(sample(x, length(x), replace = T)) 
+    }
+  mean <- mean(nonparam_mean)
+  final[1,1] <-round(mean,3)
+  nonparamL95 <- quantile(nonparam_mean, probs = 0.025)
+  final[1,2] <- round(nonparamL95,3)
+  nonparamU95 <- quantile(nonparam_mean, probs = 0.975)
+  final[1,3] <- round(nonparamU95,3)
+  return(final)
+}
+```
+
+```{r}
+# Make a list of amino acids
+amino_acids <- vector(mode="list", length=18)
+names(amino_acids) <- c("Val", "Ala", "His","Leu","Arg","Pro","Lys","Thr","Cys","Met","Tyr","Ile","Asn","Glu","Ser","Gly","Asp","Phe")
+amino_acids[[1]] <- "V"; amino_acids[[2]] <- "A"; amino_acids[[3]] <- "H"; amino_acids[[4]] <- "L"; amino_acids[[5]] <- "R"; amino_acids[[6]] <- "P"; amino_acids[[7]] <- "K"; amino_acids[[8]] <- "T"; amino_acids[[9]] <- "C"; amino_acids[[10]] <- "M"; amino_acids[[11]] <- "Y"; amino_acids[[12]] <- "I"; amino_acids[[13]] <- "N"; amino_acids[[14]] <- "E"; amino_acids[[15]] <- "S"; amino_acids[[16]] <- "G"; amino_acids[[17]] <- "D"; amino_acids[[18]] <- "F"
+
+calculate_freq <- function(x) {
+  x_freq <- x %>%
+    dplyr::mutate(freq = (alt_umi_count/(alt_umi_count+ref_umi_count)))
+  freq_table <- x_freq %>%
+    group_by(mutation_name) %>%
+    do(nonpara(.$freq,iters = 1e3))
+  sample_size <- x_freq %>% 
+    group_by(mutation_name) %>% 
+    summarise(n = n())
+  freq_table <- left_join(freq_table,sample_size,by = "mutation_name")
+  return(freq_table)
+}
+```
+
+```{r}
+ref_file <- "data/tables/reference_AA_table_final.csv"
+alt_file <- "data/tables/alternate_AA_table_final.csv"
+cov_file <- "data/tables/coverage_AA_table_final.csv"
+
+data <- miplicorn::read_tbl_ref_alt_cov(ref_file,
+                                        alt_file,
+                                        cov_file,
+                                        gene == "crt" | 
+                                          gene == "atp6" |
+                                          # arps not present 
+                                          gene == "arps" | 
+                                          gene == "crt" | 
+                                          gene == "cytb" | 
+                                          gene == "dhfr-ts" | 
+                                          gene == "dhps" | 
+                                          gene == "k13" | 
+                                          gene == "mdr1")
+
+data$sample <- extract_sampleID(data$sample)
+
+# filter coverage less than 5
+data <- data %>% 
+  dplyr::filter(!(coverage < 5))
+
+# Add Metadata
+metadata<-read_tsv("data/metadata/TAN_metadata.tsv")
+# merge some metadata columns
+data <- dplyr::left_join(data, metadata, by = c("sample" = "sample_ID"))
+```
+
+```{r}
+sample_size <- data %>% 
+  select(c(sample,Sample_Set)) %>% 
+  unique() %>% 
+  group_by(Sample_Set) %>% 
+  summarise(n= n())
+
+zan <- data %>% 
+  dplyr::filter(str_detect(Sample_Set, "ZAN")) 
+
+# 213 zan samples
+freq_zan <- calculate_freq(zan) 
+
+region <- rep('Zanzibar', nrow(freq_zan)) 
+freq_zan <- cbind(freq_zan,region = region)
+
+main <- data %>% 
+  dplyr::filter(str_detect(Sample_Set, "MAIN"))
+
+# 142 main samples
+freq_main <- calculate_freq(main)
+
+region <- rep('Mainland', nrow(freq_main)) 
+freq_main <- cbind(freq_main,region = region)
+
+freq_main_zan <- 
+  dplyr::full_join(freq_zan,freq_main) %>% 
+  # filter dataframe to all mutations greater than zero
+  filter(!(mean < 0.005))
+
+for(i in names(amino_acids)) {
+  freq_main_zan$mutation_name <- str_replace_all(freq_main_zan$mutation_name,i,amino_acids[[i]])
+} 
+
+# mutations with frequency greater than 0.005 in either population
+mutations_to_keep <- unique(freq_main_zan$mutation_name)
+
+ggplot(freq_main_zan, aes(x = mutation_name, y = mean, fill = region)) + 
+  geom_bar(stat = 'identity',position=position_dodge(), width =.4)+ 
+  coord_cartesian(ylim=c(0,1)) +
+  theme_classic() +
+  labs(y= "Frequency", 
+       #title = "Prevalence Based On Region"
+       ) +
+  guides(fill=guide_legend(title="Region")) +
+  geom_errorbar(aes(ymin=L95, ymax=U95), width=.5,
+                 position=position_dodge(.4)) +
+  scale_fill_manual(values = c("#2538be","#Bb141d")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 25),
+        axis.title = element_text(size = 35),
+        legend.text = element_text(size = 25),
+        legend.title = element_text(size = 25))
+
+ggsave("results/region_prev_greater_than_0_5.png",device = png, width = 16, height = 10, units = 'in', res = 300)
+```
+
+```{r Table 2}
+library(kableExtra)
+
+freq_zan_table <- 
+  freq_zan %>%
+  select(-region) %>% 
+  rename(mean_Z = mean,
+         L95_Z = L95,
+         U95_Z = U95,
+         n_Z = n)
+
+freq_main_table <- 
+  freq_main %>% 
+  select(-region) %>% 
+  rename(mean_M = mean,
+         L95_M = L95,
+         U95_M = U95,
+         n_M = n)
+
+freq_main_zan_tbl <- left_join(freq_zan_table,
+                               freq_main_table,
+                               by = "mutation_name") %>% 
+  mutate(across(everything(), round, 3)) %>% 
+  unite(CI_Z,L95_Z,U95_Z,remove = T, sep = "-") %>% 
+  unite(CI_M,L95_M,U95_M,remove = T, sep = "-")
+
+for(i in names(amino_acids)) {
+  freq_main_zan_tbl$mutation_name <- str_replace_all(freq_main_zan_tbl$mutation_name,i,amino_acids[[i]])
+}
+
+library(flextable)
+border_style = officer::fp_border(color="black", width=3)
+# arrange mutations by factor
+mutations_for_tbl <- c("crt-K76T","crt-M74I","crt-N75E", "dhfr-ts-S108N","dhfr-ts-N51I","dhfr-ts-C59R","dhps-A437G","dhfr-ts-I164L","dhfr-ts-S108T","dhps-A581G", "dhps-K540E", "k13-K189N", "k13-K189T", "mdr1-N86Y", "mdr1-D1246Y", "mdr1-Y184F","mdr2-I492V","dhfr-ts-A16V")
+
+freq_main_zan_tbl_present <- freq_main_zan_tbl %>% 
+  filter(mutation_name %in% mutations_for_tbl)
+
+table_sub <- 
+  freq_main_zan_tbl_present %>% 
+  mutate(mutation_name = ifelse(
+    "dhfr" %in% stringr::str_extract(mutation_name, ".+?(?=-)"),
+    paste("dhfr-",str_split_fixed(mutation_name,'-',3)[3],sep = ""),
+    mutation_name)) %>% 
+  # order alphabetically
+  arrange(stringr::str_extract(mutation_name, ".+?(?=-)"),
+          # then order by the numeric in the amino acid sequence
+          as.integer(stringr::str_extract(gsub("^.*-", "", mutation_name), "\\d+"))) %>%
+  mutate(mutation_name = paste("Pf",mutation_name,sep = "")) %>% 
+   mutate(
+    across(
+      .cols = c("mean_Z","mean_M"),
+      .fns = ~ case_when(
+        .x < 0.005 ~ 'ND†',
+        TRUE ~ as.character(.x)
+        ))) %>% 
+  mutate(
+    across(
+      .cols = c("CI_Z","CI_M"),
+      .fns = ~ case_when(
+        .x == "0-0" ~ '-',
+        TRUE ~ as.character(.x)
+        ))) %>% 
+  flextable::flextable() %>% 
+  flextable::autofit() %>% 
+  flextable::width(j=1, width = 2) %>% 
+  flextable::width(j=c(2,4), width = 1) %>% 
+  flextable::width(j=c(3,5), width = 1.5) %>% 
+  flextable::add_header_row(
+    top = TRUE,                
+    values = c("Mutation",
+               "Zanzibar",
+               "",
+               "",
+               "Mainland",
+               "",
+               "")) %>% 
+  flextable::set_header_labels(
+    mutation_name = "",
+    mean_Z = "Mutant Allele Prevalence‡",
+    CI_Z = "CI‡",
+    n_Z = "# Genotyped Samples§",
+    mean_M = "Mutant Allele Prevalence‡",
+    CI_M = "CI‡",
+    n_M = "# Genotyped Samples§") %>% 
+  # merge mutation name header
+  flextable::merge_at(i = 1:2, j = 1, part = "header") %>% 
+  # merge Zanzibar part
+  flextable::merge_at(i = 1, j = 2:4, part = "header") %>%
+  # merge Mainland part
+  flextable::merge_at(i = 1, j = 5:7, part = "header") %>%
+  # Remove all existing borders
+  flextable::border_remove() %>% 
+  # add  box theme
+  flextable::theme_box() %>%
+  # change borders
+  border(border = border_style) %>% 
+  border(border = border_style, part = "header") %>% 
+  flextable::align(align = "center", j = c(2:7), part = "all")
+save_as_image(table_sub, path = "results/selected_mts.pdf",webshot = "webshot2")
+save_as_docx(table_sub, path = "results/selected_mts.docx")
+```
+
+```{r Supplemental Figure 2B}
+plot_data <- data %>% 
+  dplyr::group_by(mutation_name) %>%
+  dplyr::summarise(n = n(),
+                   mean_coverage = mean(coverage),
+                   sdcov = sd(coverage),
+                   secov = sdcov/sqrt(n),
+                   U95CI = mean_coverage + 1.96 * secov,
+                   L95CI = mean_coverage - 1.96 * secov)
+for(i in names(amino_acids)) {
+  plot_data$mutation_name <- str_replace_all(plot_data$mutation_name,i,amino_acids[[i]])
+} 
+
+plot_data_sub <- data
+for(i in names(amino_acids)) {
+  plot_data_sub$mutation_name <- str_replace_all(plot_data_sub$mutation_name,i,amino_acids[[i]])
+}
+
+plot_data_sub <- plot_data_sub %>% 
+  subset(mutation_name %in% mutations_for_tbl) %>% 
+  dplyr::group_by(mutation_name) %>%
+  dplyr::summarise(n = n(),
+                   mean_coverage = mean(coverage),
+                   sdcov = sd(coverage),
+                   secov = sdcov/sqrt(n),
+                   U95CI = mean_coverage + 1.96 * secov,
+                   L95CI = mean_coverage - 1.96 * secov) %>% 
+  # order alphabetically
+  arrange(stringr::str_extract(mutation_name, ".+?(?=-)"),
+          # then order by the numeric in the amino acid sequence
+          as.integer(stringr::str_extract(gsub("^.*-", "", mutation_name), "\\d+"))) 
+plot_data_sub$mutation_name <- str_replace(plot_data_sub$mutation_name,"-ts-","-")
+plot_data_sub$mutation_name <- paste("Pf", plot_data_sub$mutation_name, sep = "")
+  
+
+#plot coverage
+ggplot2::ggplot(
+  data = plot_data_sub,
+  mapping = ggplot2::aes(
+    x = mutation_name,
+    y = mean_coverage)
+  ) +
+  ggplot2::geom_col(fill = "grey") +
+  scale_y_continuous(limits = c(0,700),
+                     breaks = seq(0,700,100)) +
+  theme_classic() +
+  labs(y= "Mean Coverage",
+       x = "") +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "none") +
+  ggplot2::geom_errorbar(aes(ymin=L95CI, ymax=U95CI), width=.5,
+                 position=position_dodge(.4)) 
+ggsave("results/coverage_selected.pdf",device=pdf)
+```
+
+```{r Supplemental Table 1}
+Sample_Set <- c("ZAN-Asymptomatic","ZAN-Symptomatic","MAIN-Asymptomatic","MAIN-Symptomatic")
+n_IBC <- c(21,117,34,110)
+n_DR2 <- c(52,134,0,123)
+samples_in_analysis <- 
+  data.frame(Sample_Set,n_IBC,n_DR2) %>% 
+  bind_rows(summarise(.,
+                      across(where(is.numeric), sum),
+                      across(where(is.character), ~"Total")))
+samp_tbl <- 
+  samples_in_analysis %>% 
+  flextable::flextable() %>% 
+  flextable::autofit() %>% 
+  flextable::width(j=c(1,2,3), width = 2) %>% 
+  flextable::set_header_labels(
+    Sample_Set = "Region",
+    n_IBC = "# in Genome Wide Analysis",
+    n_DR2 = "# in Drug Resistance Analysis") %>% 
+  flextable::border_remove() %>% 
+  # add  box theme
+  flextable::theme_box() %>%
+  # change borders
+  border(border = border_style) %>% 
+  border(border = border_style, part = "header") %>% 
+  flextable::align(align = "center",part = "all")
+save_as_image(samp_tbl, path = "results/samp_tbl.pdf", webshot = "webshot2")
+save_as_docx(samp_tbl, path = "results/samp_tbl.docx")
+```
