@@ -16,7 +16,7 @@ db/
 rdhs.json
 sandbox/
 ignore/
-#results/
+results/
 sharepoint/
 
 # RStudio files
