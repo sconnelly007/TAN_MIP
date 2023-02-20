@@ -12,11 +12,11 @@
 # Data files I'm generating
 datasets/
 db/
-data/
+#data/
 rdhs.json
 sandbox/
 ignore/
-results/
+#results/
 sharepoint/
 
 # RStudio files
@@ -25,16 +25,16 @@ sharepoint/
 # knitr and R markdown default cache directories
 /*_cache/
 /cache/
-*png
+#*png
 
 # Temporary files created by R markdown
 *.utf8.md
 *.knit.md
 
 # knitr outputs
-*.pdf
+#*.pdf
 *.html
-*.docx
+##*.docx
 
 # MAC files
 .DS_Store
