@@ -1,0 +1,376 @@
+---
+title: "01_PCA_Combined"
+author: "Sean Connelly"
+date: "2023-02-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("../../"))
+```
+
+
+```{r}
+# load packages 
+library(tidyverse)
+library(vcfR)
+library(sf)
+library(tidygraph)
+library(ggraph)
+library(cowplot)
+theme_set(theme_cowplot(font_size=8))
+library(MIPanalyzer)
+library(plotly)
+library(RColorBrewer)
+library(ggrepel)
+library(reticulate)
+library(adegenet)
+library(gtools)
+library(colorspace)
+library(scatterplot3d)
+# set seed
+set.seed(1)
+getwd()
+```
+
+```{r}
+extract_sampleID <- function(x) {
+  # split all three by delimiter
+  splt <- str_split_fixed(x,'-',4)
+  # make a dataframe 
+  splt_ID <- as.data.frame(splt) %>% 
+    mutate(ID = if_else(
+      V1 == 'UNC',.[[2]],
+      .[[1]]))
+  return(splt_ID$ID)
+}
+```
+
+
+```{r}
+source("R/IBD/utils.R")
+
+vcfR_T <- read.vcfR("data/vcf_targeted/vcf_nomiss.vcf.gz")
+
+# subset to biallelic sites
+vcfR_T <- vcfR_T[is.biallelic(vcfR_T),]
+
+# tidy VCF
+# extract information
+loci_T <- vcfR_T@fix[,1:2] %>% 
+  tibble::as_tibble() %>% 
+  dplyr::mutate(POS = as.numeric(POS),
+                Key = 1:dplyr::n()) %>% 
+  dplyr::select(c("CHROM", "POS", "Key"))
+
+# tidy up the data to long format
+vcf_long <- vcfR_T %>% 
+  vcfR::extract_gt_tidy()
+
+# add sample_ID column
+vcf_long$Indiv <- extract_sampleID(vcf_long$Indiv)
+
+# Add Metadata
+metadata<-read_tsv("data/metadata/TAN_metadata.tsv")
+# merge some metadata columns
+w <- match(vcf_long$Indiv, metadata$sample_ID)
+vcf_long <- cbind(vcf_long, Sample_Set = metadata[w,c('Sample_Set')])
+
+combined_long_T <- 
+  # now lets merge the loci information with the individual level information
+  dplyr::full_join(x = loci_T, y = vcf_long, by  = "Key") %>%
+  # don't need Key anymore
+  dplyr::select(-c("Key"))
+
+# iterate for all possibilities (0/0: reference, 1/1: alternate, 0/1: half alt, half het, ./.: nothing)
+combined_long_T <- combined_long_T %>% dplyr::mutate(gt = case_when(gt_GT == "0/0" ~ 0, 
+                                         gt_GT == "0/1" ~ 0.5, 
+                                         gt_GT == "1/1" ~ 1)
+)
+#mipvcf_T <- readRDS("data/biallelic_processed_TAN.rds")
+```
+
+##### Import VCF and check filtering parameters ####
+```{r}
+#### filter Kenya vcf####
+vcf_K <- read.vcfR("data/vcf_targeted/Kenya_samples/filtered_Kenya_variants_filtered.vcf.gz",verbose = FALSE)
+
+# freq
+var_freq <- read_delim("data/vcf_targeted/Kenya_samples/check_filtering/variant_check.frq", delim = "\t",
+                       col_names = c("chr", "pos", "nalleles", "nchr", "a1", "a2"), skip = 1)
+
+# find minor allele 
+var_freq$maf <- var_freq %>%  dplyr::select(a1, a2) %>% apply(1, function(z) min(z))
+minor_check <- sum(var_freq$maf < 0.01, na.rm=TRUE)
+# 0 less than 0.001
+
+# find major allele
+var_freq$major <- var_freq %>%  dplyr::select(a1, a2) %>% apply(1, function(z) max(z))
+major_check <- sum(var_freq$major > 0.99, na.rm=TRUE)
+# 0 less than 0.999
+
+# check missingness per site
+var_miss <- read_delim("data/vcf_targeted/check_filtering/variant_check.lmiss", delim = "\t",
+                       col_names = c("chr", "pos", "nchr", "nfiltered", "nmiss", "fmiss"), skip = 1)
+summary(var_miss$fmiss)
+fmiss_threshold <- sum(var_miss$fmiss > .15)
+# 0 more than 15% missingness
+```
+
+##### remove samples with high missingness from Kenyan cohort #####
+```{r}
+#filter missing samples from vcf 
+calc_loci_missingness_by_smpl <- function(vcfRobject = NULL){
+
+  gt <- vcfR::extract.gt(vcfRobject, element = "GT")
+  ret <- gt %>% as.data.frame(.) %>%
+    tidyr::gather(., key = "sample", value = "gt") %>%
+    dplyr::group_by(sample) %>%
+    dplyr::summarise(
+      n = n(),
+      misscount = sum(is.na(gt)),
+      missprop = sum(is.na(gt))/n
+    )
+
+  return(ret)
+}
+
+miss <- calc_loci_missingness_by_smpl(vcf_K)
+
+pass_miss <- miss %>% 
+  dplyr::filter(missprop < 0.1) %>% 
+  dplyr::pull("sample")
+
+vcf_K <- vcf_K[,c('FORMAT', pass_miss)]
+
+#save vcf file without missingness
+write.vcf(vcf_K, "data/vcf_targeted/Kenya_samples/vcf_K_nomiss.vcf.gz")
+
+# subset to biallelic sites
+vcf_K <- vcf_K[is.biallelic(vcf_K),]
+
+# tidy VCF
+# extract information
+loci_K <- vcf_K@fix[,1:2] %>% 
+  tibble::as_tibble() %>% 
+  dplyr::mutate(POS = as.numeric(POS),
+                Key = 1:dplyr::n()) %>% 
+  dplyr::select(c("CHROM", "POS", "Key"))
+
+# tidy up the data to long format
+vcf_long <- vcf_K %>% 
+  vcfR::extract_gt_tidy()
+
+# add sample_ID column
+vcf_long$Indiv <- extract_sampleID(vcf_long$Indiv)
+vcf_long$Sample_Set <- 'Kenya'
+
+combined_long_K <- 
+  # now lets merge the loci information with the individual level information
+  dplyr::full_join(x = loci_K, y = vcf_long, by  = "Key") %>%
+  # don't need Key anymore
+  dplyr::select(-c("Key"))
+
+# iterate for all possibilities (0/0: reference, 1/1: alternate, 0/1: half alt, half het, ./.: nothing)
+combined_long_K <- combined_long_K %>% dplyr::mutate(gt = case_when(gt_GT == "0/0" ~ 0, 
+                                         gt_GT == "0/1" ~ 0.5, 
+                                         gt_GT == "1/1" ~ 1)
+)
+saveRDS(vcf_K, file = "data/biallelic_processed_Kenya.rds")
+#mipvcf_K <- MIPanalyzer::vcf2mipanalyzer_biallelic(vcfR = vcf_K)
+#mipvcf_K$samples$ID <- extract_sampleID(mipvcf_K$samples$ID)
+```
+
+##### import DRC data and pick random 20% from all regions #####
+```{r}
+mipvcf_V <- readRDS("data/Verity_samples/biallelic_distances.rds")
+
+library(purrr)
+samples <- as.data.frame(cbind(Sample_ID = mipvcf_V$samples$ID,Country = mipvcf_V$samples$Country))
+# prop <- samples %>% 
+#   group_by(Country) %>% 
+#   summarise(
+#     num = dplyr::n(),
+#     percent = round(dplyr::n()*0.2,1)
+#     )
+
+selected_samples <- samples %>% 
+  group_by(Country) %>%
+  slice_sample(prop = 0.2)
+
+mipvcf_V <- filter_samples(x = mipvcf_V,
+                      sample_filter = mipvcf_V$samples$ID %in% selected_samples$Sample_ID, 
+                      description = "take random sample of 20% in group")
+mipvcf_V$filter_history[,1:5]
+
+# make vcf from random 20% to merge
+# a lot of NAs introduced...
+vcfR_V <- MIPanalyzerbi2vcfR(mipvcf_V)
+
+# tidy VCF
+# extract information
+loci_V <- vcfR_V@fix[,1:2] %>% 
+  tibble::as_tibble() %>% 
+  dplyr::mutate(POS = as.numeric(POS),
+                Key = 1:dplyr::n()) %>% 
+  dplyr::select(c("CHROM", "POS", "Key"))
+
+# tidy up the data to long format
+vcf_long <- vcfR_V %>% 
+  vcfR::extract_gt_tidy()
+
+# merge some metadata columns
+w <- match(vcf_long$Indiv, mipvcf_V$samples$ID)
+vcf_long <- cbind(vcf_long, Sample_Set = mipvcf_V$samples[w,c('Country')])
+
+combined_long_V <- 
+  # now lets merge the loci information with the individual level information
+  dplyr::full_join(x = loci_V, y = vcf_long, by  = "Key") %>%
+  # don't need Key anymore
+  dplyr::select(-c("Key"))
+
+# iterate for all possibilities (0/0: reference, 1/1: alternate, 0/1: half alt, half het, ./.: nothing)
+combined_long_V <- combined_long_V %>% dplyr::mutate(gt = case_when(gt_GT == "0/0" ~ 0, 
+                                         gt_GT == "0/1" ~ 0.5, 
+                                         gt_GT == "1/1" ~ 1)
+)
+```
+
+```{r}
+loci_T <- loci_T %>%
+ dplyr::select(-c("Key"))
+
+loci_K <- loci_K %>% 
+ dplyr::select(-c("Key"))
+
+loci_V <- loci_V %>%
+ dplyr::select(-c("Key"))
+
+#......................
+# need to find common between all 
+# create a dictionary or lookup table
+#......................
+locipos_lookup <- c(paste(loci_T$CHROM, loci_T$POS, sep = "_"),
+                    paste(loci_K$CHROM, loci_K$POS, sep = "_"),
+                    paste(loci_V$CHROM, loci_V$POS, sep = "_"))
+# 3 of the same lociposition gives t/f vector
+locikeep <- table(locipos_lookup) == 3
+# subset to the 3 
+locikeep <- names(locikeep[locikeep == TRUE])
+
+#......................
+# now filter 
+#......................
+combined_all <- dplyr::bind_rows(combined_long_T, combined_long_K, combined_long_V) %>% 
+  dplyr::mutate(locipos = paste(CHROM,POS, sep = "_")) %>% 
+  dplyr::filter(locipos %in% locikeep)
+
+# sanity check
+length(unique(combined_all$locipos)) == length(locikeep)
+
+# extract GT information and get WSAF for every sample at each loci
+combined_all <- combined_all %>% 
+   # lets make some new variables
+   dplyr::mutate(
+     rad = purrr::map_dbl(gt_AD, function(x){vcfR::masplit(
+       as.matrix(x), record = 1, sort = FALSE, decreasing = FALSE)}),
+     # get alternate allele depth 
+     aad = purrr::map_dbl(gt_AD, function(x){vcfR::masplit(
+       as.matrix(x), record = 2, sort = FALSE, decreasing = FALSE)}),
+     # calculate within-sample reference allele freq
+     wsaf = aad/(rad + aad),
+     wsaf = ifelse(is.nan(wsaf), NA, wsaf) # occurs when 0/0
+   ) %>% 
+  # now let's select the variables that we want
+  dplyr::select(c("Indiv", "Sample_Set", "wsaf","locipos")) 
+
+combined_all_wide <- combined_all %>% 
+  tidyr::pivot_wider(names_from = locipos, values_from = wsaf)
+
+combined_all_wsaf <- combined_all_wide %>%
+  column_to_rownames("Indiv") %>% 
+  dplyr::select(-c(Sample_Set)) 
+
+# do median of wsaf for each column
+median_wsaf <- as.vector(apply(combined_all_wsaf,2,median,na.rm=TRUE))
+
+# replace NA with median (imputation step)
+for (i in 1: length(median_wsaf)) {
+  combined_all_wsaf[is.na(combined_all_wsaf[,i]),i] <- median_wsaf[i]
+}
+```
+
+```{r Supplemental Figure 5}
+# define colors
+col_Main <- c("#2538be","#9ecae1")
+col_Zan <- c("#Bb141d","#fc9272")
+
+# PCA
+pca <- pca_wsaf(as.matrix(combined_all_wsaf))
+
+# PCA dataframe reformat
+pca_df <- as.data.frame(pca$x)
+pca_df <- tibble::rownames_to_column(pca_df, "Sample_ID")
+pca_df$Sample_Set <- combined_all_wide$Sample_Set
+
+out <- pca_df %>%
+  filter(PC1 > 1.5) %>% 
+  filter(PC2 < -2)
+
+check <- pca_df %>%
+    filter(Sample_ID %in% c("OCO31","MNK16","BIM02"))
+
+cols <- colorspace::sequential_hcl(6, palette = "Viridis")
+
+b <- ggplot(data = pca_df, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = Sample_Set), size=2, alpha=.8)
+b <- b + 
+  scale_color_manual(values = c(cols[1],"#FF9900",cols[3],col_Main,cols[4:6],col_Zan))
+b <- b + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 20, face = "bold"),
+        axis.text.x  = element_text(size=18),
+        legend.title=element_text(size = 18, face = "bold"), legend.text = element_text(size = 14),
+        strip.text = element_text(size=16,face="bold")) + 
+  labs(fill = "Region")
+b <- b + 
+  xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + 
+  ylab(paste0("PC2 (", signif(pca$var[2], 3), "%)"))
+b 
+ggsave('results/PCA_12_combined.pdf',device = pdf, width = 7.83, height = 6.07, units = 'in')
+
+colors <- c(cols[1],"#FF9900",cols[3],col_Main,cols[4:6],col_Zan)
+# use scatterplot3d
+pdf("results/scatter3d_combined.pdf", width = 7.83, height = 6.07)
+# create base plot
+s3d <- with(pca_df, 
+     scatterplot3d(PC1,
+                   PC2, 
+                   PC3, 
+                   xlab = paste0("PC1 (", signif(pca$var[1], 3), "%)"),
+                   ylab = paste0("PC2 (", signif(pca$var[2], 3), "%)"),
+                   zlab = paste0("PC3 (", signif(pca$var[3], 3), "%)"),
+                   pch = 16,
+                   color = colors[as.factor(pca_df$Sample_Set)],
+                   grid = FALSE, 
+                   box = TRUE,
+                   cex.axis = 1.2,
+                   cex.lab = 1.5))
+# s3d$xyz.convert(-10, 0, 14)
+legend("bottom",
+       inset = -0.2,
+       cex=0.8,
+       legend = levels(as.factor(pca_df$Sample_Set)),
+       col = colors, 
+       xpd = TRUE,
+       horiz = TRUE,
+       pch = 16,
+       x.intersp = 0.2,
+       text.width = 1.05)
+dev.off()
+
+```
+
+
+
