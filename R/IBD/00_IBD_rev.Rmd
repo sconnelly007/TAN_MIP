@@ -1,0 +1,2098 @@
+---
+title: "01_IBD"
+author: "Sean Connelly"
+date: "2023-02-16"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath("../../"))
+```
+
+```{r}
+# load packages 
+library(tidyverse)
+library(vcfR)
+library(sf)
+library(tidygraph)
+library(ggraph)
+library(cowplot)
+theme_set(theme_cowplot(font_size=8))
+library(MIPanalyzer)
+library(plotly)
+library(RColorBrewer)
+library(ggrepel)
+library(reticulate)
+library(adegenet)
+library(gtools)
+library(geodata)
+library(ggnewscale)
+library(gt)
+library(gridExtra)
+library(adegenet)
+library(scatterplot3d)
+# set seed
+set.seed(1)
+getwd()
+extrafont::loadfonts()
+```
+
+```{r function for nonparametric mean, echo=FALSE}
+nonpara <- function(x,iters,measure) {
+  # make as dataframe
+  final <- matrix(data = NA, nrow = length(unique(x$Sample_Set)), ncol = 4)
+  final <- as.data.frame(final)
+  colnames(final) <- c('Sample_Set','mean','L95','U95')
+  for (i in 1:length(unique(x$Sample_Set))) {
+    subset <- x %>% 
+      filter(Sample_Set == unique(x$Sample_Set)[i])
+    subset_to_samp <- subset[[measure]]
+    nonparam_mean <- rep(NA, iters)
+    for (q in 1:iters) {
+      nonparam_mean[q] <- mean(sample(subset_to_samp, length(subset_to_samp), replace = T)) 
+    }
+    final[i,1] <- unique(x$Sample_Set)[i]
+    mean <- mean(nonparam_mean)
+    final[i,2] <-round(mean,3)
+    nonparamL95 <- quantile(nonparam_mean, probs = 0.025)
+    final[i,3] <- round(nonparamL95,3)
+    nonparamU95 <- quantile(nonparam_mean, probs = 0.975)
+    final[i,4] <- round(nonparamU95,3)
+  }
+  return(final)
+}
+```
+
+```{r}
+extract_sampleID <- function(x) {
+  # split all three by delimiter
+  splt <- str_split_fixed(x,'-',4)
+  # make a dataframe 
+  splt_ID <- as.data.frame(splt) %>% 
+    mutate(ID = if_else(
+      V1 == 'UNC',.[[2]],
+      .[[1]]))
+  return(splt_ID$ID)
+}
+```
+
+```{r}
+median_IQR <- function(x,iters,measure) {
+  # make as dataframe
+  final <- matrix(data = NA, nrow = length(unique(x$Sample_Set)), ncol = 5)
+  final <- as.data.frame(final)
+  colnames(final) <- c('Sample_Set','nonzero','median','L25','U75')
+  for (i in 1:length(unique(x$Sample_Set))) {
+    final[i,1] <- unique(x$Sample_Set)[i]
+    nonzero <- sum(x$malecotf != 0)
+    final[i,2] <- nonzero
+    median <- median(x$malecotf)
+    final[i,3] <-round(median,2)
+    L25 <- quantile(x$malecotf, probs = 0.25)
+    final[i,4] <- round(L25,2)
+    U75 <- quantile(x$malecotf, probs = 0.75)
+    final[i,5] <- round(U75,2)
+  }
+  return(final)
+}
+```
+
+# Import VCF
+
+```{r, get biallelic file}
+source("r/IBD/utils.R")
+vcf <- read.vcfR("data/vcf_targeted/vcf_nomiss.vcf.gz", verbose = FALSE)
+
+# subset to biallelic sites
+vcf<- vcf[is.biallelic(vcf),]
+
+# get genotype data
+gts_chr <- vcfR::extract.gt(vcf, element = "AD", as.numeric = T)
+# check VCF for missing data
+#vcfR::heatmap.bp(gts_chr)
+
+gt <- vcfR::extract.gt(vcf, element = "GT")
+gt <- dplyr::bind_cols("chrom" = vcfR::getCHROM(vcf), "pos" = vcfR::getPOS(vcf), gt)
+gt %>%
+  tibble::as_tibble() %>%
+  tidyr::pivot_longer(., cols = !c("chrom", "pos")) %>%
+  dplyr::mutate(ishet = dplyr::case_when(value == "0/0" ~ FALSE,
+                                         value == "0/1" ~ TRUE,
+                                         value == "1/1" ~ FALSE)) %>%
+  dplyr::group_by(name) %>%
+  tidyr::drop_na() %>% 
+  dplyr::summarise(
+    propHet = mean(ishet)) %>% 
+  ggplot() +
+  geom_point(aes(x = name, y = propHet)) +
+  ylab("Proportion of Sample that is Het") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.75, hjust = 0.5))
+
+# check outliers
+het_check <- gt %>%
+  tibble::as_tibble() %>%
+  tidyr::pivot_longer(., cols = !c("chrom", "pos")) %>%
+  dplyr::mutate(ishet = dplyr::case_when(value == "0/0" ~ FALSE,
+                                         value == "0/1" ~ TRUE,
+                                         value == "1/1" ~ FALSE)) %>%
+  dplyr::group_by(name) %>%
+  tidyr::drop_na() %>% 
+  dplyr::summarise(
+    propHet = mean(ishet)) 
+
+outliers <- c("WSA41-JJJ-1", "AJM38-JJJ-1", "AKO45-JJJ-1", "KSA30-JJJ-1",rownames(sub))
+
+het_check <- het_check %>% 
+  filter(name %in% outliers)
+
+mipvcf <- MIPanalyzer::vcf2mipanalyzer_biallelic(vcfR = vcf)
+
+# replace sample info with split version
+mipvcf$samples$SAMPLE_ID <- extract_sampleID(mipvcf$samples$SAMPLE_ID) 
+mipvcf$samples <- mipvcf$samples %>% 
+  rename(ID = SAMPLE_ID)
+
+centroid <- read_csv("data/metadata/samples_centroid_08222022_final.csv")
+centroid <- dplyr::rename(centroid, "ID" = `Sample Name`) #%>% 
+  #dplyr::select(-c("metadata_latitude","metadata_longitude","Shehia","Notes"))
+colnames(centroid) <- gsub(' ','_',colnames(centroid))
+centroid$District_N <- str_replace_all(centroid$District_N ,"Rungwe","Mainland")
+
+# subset by district 
+centroid_distinct <- centroid %>%
+  dplyr::select(c("Shehia_match","District_N","lat_centroid","lon_centroid")) %>% 
+  distinct()
+
+# merge some metadata columns
+mipvcf$samples <- dplyr::left_join(mipvcf$samples, centroid, by = 'ID')
+
+saveRDS(mipvcf, file = "data/biallelic_processed_TAN.rds")
+```
+
+```{r}
+# get IBS
+ibs <- MIPanalyzer::get_IBS_distance(x = mipvcf,
+                                     ignore_het = FALSE,
+                                     report_progress = FALSE)
+
+# tidy result
+colnames(ibs) <- rownames(ibs) <- mipvcf$samples$ID
+
+# convert to 
+ibs_long <- broom::tidy(as.dist(ibs)) %>%  
+  magrittr::set_colnames(c("smpl1", "smpl2", "ibsdist")) 
+
+centroid$smpl1 <-centroid$ID 
+centroid$smpl2 <-centroid$ID 
+
+ibs_long_meta <- 
+  dplyr::left_join(ibs_long,
+                   centroid %>% dplyr::select(smpl1, Sample_Set, Shehia_match, lat_centroid, lon_centroid), 
+                   by = "smpl1") %>% 
+  rename_at(vars(-(1:3)), ~ paste0(., '_1'))
+
+ibs_long_meta <-  
+  dplyr::left_join(ibs_long_meta,
+                   centroid %>% dplyr::select(smpl2, Sample_Set, Shehia_match, lat_centroid, lon_centroid), 
+                   by = "smpl2") %>% 
+  rename_at(vars(-(1:7)), ~ paste0(., '_2'))
+
+# boxplot result
+ibs_long %>%
+  ggplot() +
+  geom_boxplot(aes(y = ibsdist),
+               outlier.colour = "red", outlier.shape=8,
+               outlier.size=4) +
+  ylab("IBS Values") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+```{r}
+ibd <- MIPanalyzer::inbreeding_mle(x = mipvcf,
+                                   f = seq(0.01, 0.99, 0.01),
+                                   ignore_het = FALSE,
+                                   report_progress = FALSE)
+# tidy result
+diag(ibd$mle) <- 1
+colnames(ibd$mle) <- rownames(ibd$mle) <- mipvcf$samples$ID
+
+ibd_mle_long <- broom::tidy(as.dist(t(ibd$mle))) %>%  # note, mipanalyzer returns upper triangle
+  magrittr::set_colnames(c("smpl1", "smpl2", "malecotf"))
+
+ibd_mle_long <- 
+  dplyr::left_join(ibd_mle_long,
+                   centroid %>% dplyr::select(smpl1, Sample_Set, Shehia_match, lat_centroid, lon_centroid,island), 
+                   by = "smpl1") %>% 
+  rename_at(vars(-(1:3)), ~ paste0(., '_1'))
+
+ibd_mle_long <-  
+  dplyr::left_join(ibd_mle_long,
+                   centroid %>% dplyr::select(smpl2, Sample_Set, Shehia_match, lat_centroid, lon_centroid,island), 
+                   by = "smpl2") %>% 
+  rename_at(vars(-(1:8)), ~ paste0(., '_2'))
+
+# highly related pairs
+# greater than or equal to 0.9, between Zan and Zan or Main and Main
+highly_related <- ibd_mle_long %>% 
+  filter(malecotf >= 0.9)
+```
+
+```{r IBD Region together}
+# define colors
+col_Main <- c("#2538be","#9ecae1")
+col_Zan <- c("#Bb141d","#fc9272")
+
+Main_df <- ibd_mle_long %>%
+  filter(
+    (str_detect(Sample_Set_1, 'MAIN') & str_detect(Sample_Set_2, 'MAIN'))
+    ) %>% 
+  mutate(Sample_Set = rep('1_Mainland',times=nrow(.)))
+
+# total pairwise comparisons in mainland
+above_0.25 <- Main_df %>% 
+  dplyr::filter(malecotf >= 0.25)
+above_0.25_n <- length(above_0.25$malecotf)
+total <- length(Main_df$malecotf)
+
+# Mainland summary stats
+Main_df_no_zero <- Main_df %>%
+  dplyr::filter(!(malecotf == 0))
+Main_df_summary <- median_IQR(Main_df_no_zero)
+
+Zan_df <- ibd_mle_long %>%
+  filter(
+    (str_detect(Sample_Set_1, 'ZAN') & str_detect(Sample_Set_2, 'ZAN'))
+    ) %>% 
+  mutate(Sample_Set = rep('2_Zanzibar',times=nrow(.)))
+
+# total pairwise comparisons in zanzibar
+above_0.25 <- Zan_df %>% 
+  dplyr::filter(malecotf >= 0.25)
+above_0.25_n <- length(above_0.25$malecotf)
+total <- length(Zan_df$malecotf)
+
+# Zanzibar summary stats
+Zan_df_no_zero <- Zan_df %>% 
+  dplyr::filter(!(malecotf == 0))
+Zan_df_summary <- median_IQR(Zan_df_no_zero)
+
+Main_Zan_df <- ibd_mle_long %>%
+  filter(
+    (str_detect(Sample_Set_1, 'ZAN') & str_detect(Sample_Set_2, 'MAIN')) | 
+      (str_detect(Sample_Set_1, 'MAIN') & str_detect(Sample_Set_2, 'ZAN'))
+    ) %>% 
+  mutate(Sample_Set = rep('3_Main_Zan',times=nrow(.)))
+
+# Main/Zan summary stats
+Main_Zan_df_no_zero <- Main_Zan_df %>% 
+  dplyr::filter(!(malecotf == 0))
+Main_Zan_df_summary <- median_IQR(Main_Zan_df_no_zero)
+
+all_medians <- dplyr::bind_rows(Main_df_summary,Zan_df_summary,Main_Zan_df_summary)
+
+##### table ####
+all_medians %>% 
+  dplyr::mutate(Sample_Set = recode(Sample_Set, "1_Mainland"="Mainland", "2_Zanzibar"="Zanzibar", "3_Main_Zan"="Mainland-Zanzibar")) %>% 
+  gt() %>%
+  cols_label(
+    Sample_Set = html("Region"),
+    nonzero = html("Total Nonzero Comparisons"),
+    median= html("Median"),
+    L25 = html("Lower 25% Quantile"),
+    U75 = html("Upper 75% Quantile")
+    ) %>% 
+   cols_width(everything() ~ px(150)) %>% 
+  gt::gtsave(filename = "results/IBD_Region_table.pdf", expand = 10)
+
+#
+medians_to_plot <- 
+  dplyr::bind_rows(median_IQR(Main_df),
+                   median_IQR(Zan_df),
+                   median_IQR(Main_Zan_df)) 
+
+# 
+dplyr::bind_rows(Main_df,Zan_df,Main_Zan_df) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Sample_Set,
+                   y = malecotf, 
+                   color = Sample_Set),
+               outlier.shape=4,
+               outlier.size=4,
+               alpha = .75,
+               color = c(col_Main[1],col_Zan[1],'#A020F0')) +
+  ylab("IBD MLE Values") +
+  theme_bw() +
+  theme(axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 25),
+        axis.title = element_text(size = 35),
+        legend.position="none") +
+  scale_y_continuous(breaks=seq(0,1,0.1), limits = c(0,1)) +
+  scale_x_discrete(labels=c("Mainland","Zanzibar","Main-Zan"))
+  #geom_point(data = medians_to_plot, aes(x = Sample_Set,y = median), color = "black", size = 3) +
+  #geom_errorbar(data = medians_to_plot, aes(x = Sample_Set, ymin=L25, ymax=U75), width=0.5, color = "black")
+
+ggsave("results/IBD_Region.png", device = png, width = 8, height = 10, units = 'in', res = 300)
+```
+
+```{r IBD Clinical Status together}
+make_subet_df <- function(region1,region2,label) {
+  ibd_mle_long %>%
+  filter(
+    (str_detect(Sample_Set_1, region1) & str_detect(Sample_Set_2, region2)) | 
+      (str_detect(Sample_Set_1, region2) & str_detect(Sample_Set_2, region1))
+    ) %>% 
+    mutate(Sample_Set = rep(label,times=nrow(.)))
+}
+
+asym_between_df <- make_subet_df('MAIN-A','ZAN-A','5_Main_Zan_A')
+
+sym_between_df <- make_subet_df('MAIN-S','ZAN-S','6_Main_Zan_S')
+
+asym_Zan_df <- make_subet_df('ZAN-A','ZAN-A','3_Zan_A')
+
+sym_Zan_df <- make_subet_df('ZAN-S','ZAN-S','4_Zan_S')
+
+asym_Main_df <- make_subet_df('MAIN-A','MAIN-A','1_Main_A')
+
+sym_Main_df <- make_subet_df('MAIN-S','MAIN-S','2_Main_S')
+
+#### bootstrap #####
+means <- asym_between_df %>% 
+  summarise_at(vars(malecotf), ~ mean(.x, na.rm = TRUE))
+
+nonpara_sum_asym_Main_df <- nonpara(asym_Main_df,1e4,measure = 'malecotf')
+nonpara_sum_sym_Main_df <- nonpara(sym_Main_df,1e4,measure = 'malecotf')
+nonpara_sum_asym_Zan_df <- nonpara(asym_Zan_df,1e4,measure = 'malecotf')
+nonpara_sum_sym_Zan_df <- nonpara(sym_Zan_df,1e4,measure = 'malecotf')
+nonpara_sum_asym_between <- nonpara(asym_between_df,1e4,measure = 'malecotf')
+nonpara_sum_sym_between_df <- nonpara(sym_between_df,1e4,measure = 'malecotf')
+
+all_means <- dplyr::bind_rows(nonpara_sum_asym_Main_df,nonpara_sum_sym_Main_df,nonpara_sum_asym_Zan_df,nonpara_sum_sym_Zan_df,nonpara_sum_asym_between,nonpara_sum_sym_between_df)
+
+all_means %>% 
+  gt() %>% 
+  cols_label(
+    Sample_Set = html("Region and Clinical Status"),
+    mean= html("Mean"),
+    L95 = html("Lower 95% CI"),
+    U95 = html("Upper 95% CI")
+  ) %>% 
+   cols_width(
+    everything() ~ px(200)
+  ) %>% 
+  gtsave("results/IBD_Clinical_Status_table.png", expand = 10)
+
+
+dplyr::bind_rows(asym_between_df,sym_between_df,asym_Zan_df,sym_Zan_df,asym_Main_df,sym_Main_df) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Sample_Set,
+                   y = malecotf, 
+                   color = Sample_Set),
+               outlier.shape=4,
+               outlier.size=4,
+               alpha = .75,
+               color = c(col_Main,col_Zan,'#A020F0','#bcbddc')) +
+  ylab("IBD MLE Values") +
+  theme_bw() +
+  scale_shape_manual(values = c(15,16,15,16,4,4)) +
+  theme(axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 25),
+        axis.title = element_text(size = 35),
+        legend.position="none") +
+  scale_y_continuous(breaks=seq(0,1,0.1), limits = c(0,1)) +
+  scale_x_discrete(labels=c('Main-A','Main-S','Zan-A','Zan-S','Main-Zan-A','Main-Zan-S')) +
+  geom_point(data = all_means, aes(x = Sample_Set,y = mean), color = "black") +
+  geom_errorbar(data = all_means, aes(x = Sample_Set, ymin=L95, ymax=U95), width=.3, color = "black")
+
+ggsave("results/IBD_Clinical_Status.png", device = png, width = 14, height = 10, units = 'in', res = 300)
+```
+
+#### PCA
+
+```{r}
+wsaf <- get_wsaf(mipvcf)
+pca <- pca_wsaf(wsaf)
+
+pca$Sample_Set <- mipvcf$samples$Sample_Set
+
+pca_df <- as.data.frame(pca$x)
+pca_df <- tibble::rownames_to_column(pca_df, "Sample_ID")
+pca_df$Sample_ID <- extract_sampleID(pca_df$Sample_ID)
+
+# merge some metadata columns
+w <- match(pca_df$Sample_ID, centroid$ID)
+pca_df <- cbind(pca_df, centroid[w,c("Sample_Set")])
+```
+
+#### Plot PCA 2D
+
+```{r}
+cols <- c(col_Main,col_Zan)
+symbols <- c(15,16,15,16)
+plot_PCA <- function(df, axis1,axis2,colors_for_plt,symbols_for_plt) {
+  plt <- ggplot(data = df, aes(x = {{axis1}}, y = {{axis2}})) +
+  # points
+  geom_point(aes(color = Sample_Set,shape=Sample_Set), size = 3, show.legend = TRUE) +
+  # colouring
+  scale_color_manual(values = cols) +
+  scale_shape_manual(values = symbols) +
+  # custom labels
+  labs(x = 'PC1', 
+       y = 'PC2',
+       color = "Region", 
+       shape = "Region") +
+  theme(axis.text  = element_text(size=15),
+        axis.title = element_text(size=25))
+  return(plt)
+}
+PCA1and2 <- plot_PCA(pca_df,PC1,PC2,cols,symbols) + 
+  xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + 
+  ylab(paste0("PC2 (", signif(pca$var[2], 3), "%)"))
+  
+PCA1and3 <- plot_PCA(pca_df,PC1,PC3,cols,symbols) + 
+  xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + 
+  ylab(paste0("PC3 (", signif(pca$var[3], 3), "%)"))
+```
+
+##### Plot PCA 3D
+
+```{r Supplemental Figure 3A}
+#### PCA ####
+# plot with highly related
+# use scatterplot3d
+pdf("results/scatter3d_high.pdf", width = 7.83, height = 6.07)
+# create base plot
+s3d <- with(pca_df, 
+     scatterplot3d(PC1,
+                   PC2, 
+                   PC3, 
+                   xlab = paste0("PC1 (", signif(pca$var[1], 3), "%)"),
+                   ylab = paste0("PC2 (", signif(pca$var[2], 3), "%)"),
+                   zlab = paste0("PC3 (", signif(pca$var[3], 3), "%)"),
+                   pch = symbols[as.factor(pca_df$Sample_Set)],
+                   color= cols[as.factor(pca_df$Sample_Set)],
+                   grid=FALSE, 
+                   box=TRUE,
+                   cex.axis = 1.2,
+                   cex.lab = 1.5))
+# s3d$xyz.convert(-10, 0, 14)
+legend("top",
+       inset = -0.1, 
+       bty="n", 
+       cex=1.5,
+       legend = levels(as.factor(pca_df$Sample_Set)),
+       col = cols, 
+       pch = symbols,
+       text.width = 1.3,
+       xpd = TRUE, 
+       horiz = TRUE,
+       x.intersp = 0.5)
+dev.off()
+
+
+```
+
+#### PCA without isolates with an IBD of greater than 0.9
+
+```{r Figure 1A}
+# filter mipvcf based on IBD > 0.9
+IBD_high <- ibd_mle_long %>% 
+  filter(malecotf > 0.9)
+
+sample_ID_to_exclude_all <- unique(c(IBD_high$smpl1,IBD_high$smpl2))
+collapse_to_1 <- sample(sample_ID_to_exclude_all,1)
+sample_ID_to_exclude <- sample_ID_to_exclude_all[sample_ID_to_exclude_all != collapse_to_1]
+
+mipvcf_PCA <- filter_samples(x = mipvcf,
+                      sample_filter = !(mipvcf$samples$ID %in% sample_ID_to_exclude), 
+                      description = "drop samples with IBD greater than 0.9")
+
+mipvcf_PCA$filter_history[,1:5]
+
+wsaf <- get_wsaf(mipvcf_PCA)
+pca <- pca_wsaf(wsaf)
+
+pca$Sample_Set <- mipvcf_PCA$samples$Sample_Set
+
+pca_df <- as.data.frame(pca$x)
+pca_df <- tibble::rownames_to_column(pca_df, "Sample_ID")
+pca_df$Sample_ID <- extract_sampleID(pca_df$Sample_ID)
+
+# merge some metadata columns
+w <- match(pca_df$Sample_ID, centroid$ID)
+pca_df <- cbind(pca_df, centroid[w,c("Sample_Set")])
+
+# use scatterplot3d
+cols <- c(col_Main,col_Zan)
+symbols <- c(15,16,15,16)
+pdf("results/scatter3d_nohigh.pdf", width = 7.83, height = 6.07)
+# create base plot
+s3d <- with(pca_df, 
+     scatterplot3d(PC1,
+                   PC2, 
+                   PC3, 
+                   xlab = paste0("PC1 (", signif(pca$var[1], 3), "%)"),
+                   ylab = paste0("PC2 (", signif(pca$var[2], 3), "%)"),
+                   zlab = paste0("PC3 (", signif(pca$var[3], 3), "%)"),
+                   pch = symbols[as.factor(pca_df$Sample_Set)],
+                   color = cols[as.factor(pca_df$Sample_Set)],
+                   grid = FALSE, 
+                   box = TRUE,
+                   cex.axis = 1.2,
+                   cex.lab = 1.5))
+# s3d$xyz.convert(-10, 0, 14)
+legend("top",
+       inset = -0.1, 
+       bty="n", 
+       cex=1.5,
+       legend = levels(as.factor(pca_df$Sample_Set)),
+       col = cols, 
+       pch = symbols,
+       text.width = 1.3,
+       xpd = TRUE, 
+       horiz = TRUE,
+       x.intersp = 0.5)
+dev.off()
+
+out <- as.data.frame(pca$x) %>%
+  filter(PC1 > 2) %>% 
+  filter(PC2 > 5)
+out <- tibble::rownames_to_column(out, "ID")
+out$ID <- extract_sampleID(out$ID)
+
+PCA1and2_nohigh <- plot_PCA(pca_df,PC1,PC2,cols,symbols) + 
+  xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + 
+  ylab(paste0("PC2 (", signif(pca$var[2], 3), "%)"))
+PCA1and3_nohigh <- plot_PCA(pca_df,PC1,PC3,cols,symbols) +
+  xlab(paste0("PC1 (", signif(pca$var[1], 3), "%)")) + 
+  ylab(paste0("PC3 (", signif(pca$var[3], 3), "%)"))
+```
+
+```{r DPAC}
+x <- vcfR2genlight(vcf)
+
+# create pseudohaplotypes utilizing matrix of GT counts
+mat <- as.data.frame(tab(x)) %>% 
+  round(digits = 0)
+haplotype <- apply(mat, 1, paste, collapse = "")
+haplotype <- as.data.frame(haplotype)
+haplotype_nodup <- distinct(haplotype)
+lost <- rownames(haplotype)[!(rownames(haplotype) %in% rownames(haplotype_nodup))]
+keep <- rownames(haplotype_nodup)
+
+# only keep unique samples
+x <- x[indNames(x) %in% keep]
+
+sample_names <- as.data.frame(x$ind.names)
+colnames(sample_names)<-c("sample_id")
+n_occur <- data.frame(table(sample_names$sample_id))
+
+# set first element of df equal to sample ID
+sample_names$sample_id <- extract_sampleID(sample_names$sample_id)
+x$ind.names <- extract_sampleID(sample_names$sample_id)
+
+# merge some metadata columns
+# fix extra columns
+w <- match(sample_names$sample_id, centroid$ID)
+sample_names <- cbind(sample_names$sample_id, centroid[w,])
+sample_names <- sample_names[-1]
+
+sample_names <- sample_names %>% 
+  mutate(Region=str_extract(Sample_Set,"ZAN|MAIN"))
+```
+
+#### Network Analysis
+
+```{r}
+getPalette <- colorRampPalette(brewer.pal(9, "Set1"))
+
+# subset by within shehia and highly related (siblings)
+shehia_analysis <- ibd_mle_long %>%
+  dplyr::filter(
+    (str_detect(Sample_Set_1, "ZAN") & str_detect(Sample_Set_2, "ZAN"))) %>%
+  dplyr::filter(
+    (Shehia_match_1 == Shehia_match_2)) %>% 
+  dplyr::filter(malecotf >= 0.50)
+```
+
+#### Make geographic map
+
+```{r Supplemental Figure 1}
+library(ggspatial)
+# Read in Tanzania and Zanzibar geographic map
+tanzania_map <- read_sf(dsn = "R/IBD/gadm40_TZA_shp")
+
+# find all shehias in the centroid dataframe
+all_shehias <- centroid %>%
+  # no Shehia info for those two samples
+  dplyr::filter(
+    (!str_detect(ID, "ARA38"))) %>% 
+  dplyr::filter(
+    (!str_detect(ID, "HAF30"))) %>% 
+  dplyr::select(c("Shehia_match","lon_centroid", "lat_centroid")) %>%
+  dplyr::filter(!duplicated(.))
+
+ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.7, 40), ylim = c(-7,-4.8), expand = FALSE) +
+  geom_point(data = all_shehias, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F,
+             color = "blue", shape = 15, size = 3, alpha = 0.6) +
+  theme_void() +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in")) +
+  #annotate("text", label = "Unguja", x = 40, y = -6)
+  geom_text(fontface = "bold",mapping=aes(x=39.66, y=-6.55, label="Unguja"), nudge_y = 0.5, color="black", size = 7) +
+  geom_text(fontface = "bold",mapping=aes(x=39.4, y=-5.66, label="Pemba"), nudge_y = 0.5, color="black", size = 7) +
+  geom_point(mapping=aes(x=39.2, y=-6.2),show.legend = F,
+             color = "red", shape = 15, size = 3, alpha = 0.6)
+
+ggsave("results/shehia_map.pdf",device = pdf)
+```
+
+```{r Supplemental Figure 4 and Figure 2}
+library(broom)
+BAGAMOYO <- centroid %>% 
+  dplyr::filter(Shehia_match == "BAGAMOYO") %>% 
+  dplyr::select(c("Shehia_match","lon_centroid", "lat_centroid")) %>%
+  dplyr::filter(!duplicated(.)) %>% 
+  dplyr::mutate(Cluster = 1)
+
+# find all shehias in the centroid dataframe
+shehias_to_cluster <- centroid %>%
+  # no Shehia info for those two samples
+  dplyr::filter(
+    (!str_detect(ID, "ARA38"))) %>% 
+  dplyr::filter(
+    (!str_detect(ID, "HAF30"))) %>% 
+  dplyr::select(c("Shehia_match","lon_centroid", "lat_centroid")) %>%
+  dplyr::filter(!duplicated(.)) %>% 
+  dplyr::filter(!(Shehia_match == "BAGAMOYO"))
+
+# extract only lat/lon coordinates
+shehias_to_cluster_nolatlon <- shehias_to_cluster %>% 
+  dplyr::filter(!(Shehia_match == "BAGAMOYO")) %>% 
+  dplyr::select(lat_centroid,lon_centroid)
+
+# Run analysis with multiple cluster options
+kclusts <- 
+  # run 1 to 10 clusters
+  dplyr::tibble(n_clusts = 1:10) %>%
+  dplyr::mutate(
+    # run kmeans for each cluster
+    kclust = purrr::map(
+      n_clusts,
+      ~kmeans(shehias_to_cluster_nolatlon, centers = .x, iter.max = 10, nstart = 25)
+    ),
+    # map the cluster assignments to the raw dataframe for each cluster
+    augmented = purrr::map(kclust, broom::augment, shehias_to_cluster),
+    # create a nested dataframe with cluster, the lat/lon value, the size of individuals in that cluster, and the
+    # withinss
+    tidied = purrr::map(kclust, broom::tidy),
+    # create a nested dataframe with the summary statistics for the different k's
+    glanced = purrr::map(kclust, broom::glance)
+  ) %>%
+  # remove overall dataframe with all the data
+  dplyr::select(-kclust)
+
+# extract assignments
+point_assignments <- kclusts %>%
+  dplyr::select(n_clusts, augmented) %>%
+  tidyr::unnest(augmented)
+
+# extract information about the size and withinss of each cluster
+cluster_info <- kclusts %>%
+  dplyr::select(n_clusts, tidied) %>% 
+  tidyr::unnest(tidied)
+
+# extract the k means summary stats
+model_stats <- kclusts %>%
+  dplyr::select(n_clusts, glanced) %>% 
+  tidyr::unnest(glanced)
+
+# chose 4 clusters as the optimum
+ggplot2::ggplot(data = model_stats, aes(n_clusts, tot.withinss)) +
+  ggplot2::geom_line() +
+  ggplot2::geom_point() +
+  ggplot2::scale_x_continuous(limits = c(1, 10), breaks = seq(1, 10, 1)) +
+  xlab("Number of K Clusters") +
+  ylab("Total Within-Clusters Sum of Squares")
+ggsave("results/k_means_diagnostic.pdf",device = pdf)
+
+# only select the assignment with k = 4
+point_assignments_opt <- point_assignments %>% 
+  filter(n_clusts == 4)
+
+# add this cluster info to the original dataframe
+shehias_to_cluster <- shehias_to_cluster %>%
+  mutate(Cluster = as.numeric(point_assignments_opt$.cluster)+1) %>% 
+  bind_rows(.,BAGAMOYO)
+
+geographic_names <- c("Pemba","Unguja_N", "Unguja_C", "Unguja_S","Mainland")
+
+max_lats <- shehias_to_cluster %>%
+  group_by(Cluster) %>% 
+  summarize(max_lat = max(lat_centroid)) %>% 
+  ungroup() %>% 
+  arrange(desc(max_lat)) %>%
+  mutate(Geo_Name = geographic_names)
+
+shehias_to_cluster <- shehias_to_cluster %>%
+  left_join(max_lats, by = "Cluster")
+
+ordered_geo_names <- shehias_to_cluster %>%
+  arrange(desc(max_lat)) %>%
+  distinct(Geo_Name, .keep_all = TRUE) %>%
+  pull(Geo_Name)
+
+shehias_to_cluster <- shehias_to_cluster %>%
+  mutate(Geo_Name = factor(Geo_Name, levels = ordered_geo_names))
+
+col <- brewer.pal(n = length(unique(shehias_to_cluster$Geo_Name)), name = "Set2")
+# map of clusters
+clust_map <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.7, 40), ylim = c(-7,-4.8), expand = FALSE) +
+  geom_point(data = shehias_to_cluster, aes(x = lon_centroid, y = lat_centroid, color = Geo_Name),
+             show.legend = T,
+             shape = 15, size = 3, alpha = 0.6) +
+  scale_colour_manual(values = col) +
+  theme_void() +
+  guides(color=guide_legend(title="Cluster")) +
+  theme(#panel.border = element_rect(colour = "black", fill=NA, size=2),
+        legend.position="left",
+        #legend.title = element_text(size = 25),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 15),
+        legend.direction="horizontal") +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+clust_map2 <- clust_map + theme(legend.position = "none")
+le1 <- cowplot::get_legend(clust_map)
+clust_map_final <- cowplot::plot_grid(clust_map2, le1, nrow = 2, rel_heights = c(1, 0.2))
+ggsave(clust_map_final,file = "results/clust_map.pdf", device = pdf, width = 7, height = 5, units = 'in')
+
+shehias_to_cluster <- shehias_to_cluster %>%
+  select(c("Shehia_match","Geo_Name")) %>% 
+  rename(Shehia_match_1 = Shehia_match)
+shehias_to_cluster$Shehia_match_2 <- shehias_to_cluster$Shehia_match_1
+
+# add k-means to IBD dataframe
+ibd_mle_long_kmeans <- 
+  shehias_to_cluster %>% 
+  select(-Shehia_match_2) %>% 
+  dplyr::left_join(ibd_mle_long,
+                   ., 
+                   by = "Shehia_match_1") %>% 
+  rename(Geo_Name_1 = Geo_Name) %>% 
+  # filter samples without shehia info
+  filter(!(smpl1 %in% c("ARA38","HAF30"))) %>% 
+  filter(!(smpl2 %in% c("ARA38","HAF30")))
+
+ibd_mle_long_kmeans <-  
+  shehias_to_cluster %>% 
+  select(-Shehia_match_1) %>% 
+  dplyr::left_join(ibd_mle_long_kmeans,
+                   ., 
+                   by = "Shehia_match_2") %>% 
+  rename(Geo_Name_2 = Geo_Name)
+
+make_subet_df <- function(region1,region2,label) {
+  ibd_mle_long_kmeans %>%
+  filter(
+    (str_detect(Geo_Name_1, region1) & str_detect(Geo_Name_2, region2)) | 
+      (str_detect(Geo_Name_1, region2) & str_detect(Geo_Name_2, region1))
+    ) %>% 
+    mutate(label_to_plt = rep(label,times=nrow(.)))
+}
+
+library(ggbeeswarm)
+# create empty list to fill
+#datalist <- list()
+plist <- list()
+# number of possible combinations
+combinations <- as.data.frame(combinations(n = 5,r = 2,v=1:5, repeats.allowed = T))
+
+combinations_named <- sapply(combinations, function(pair) {
+  sapply(pair, function(x) geographic_names[x])
+})
+
+# pairwise_df <- make_subet_df(as.character(combinations[i,1]),
+#                                  as.character(combinations[i,2]),
+#                                  paste(as.character(combinations[i,1]),
+#                                       as.character(combinations[i,2]),
+#                                sep = "-"))
+
+# create pairwise comparison dataframes
+for (i in 1:nrow(combinations_named)) {
+  pairwise_df <- make_subet_df(as.character(combinations_named[i,1]),
+                                 as.character(combinations_named[i,2]),
+                                 paste(as.character(combinations_named[i,1]),
+                                      as.character(combinations_named[i,2]),
+                               sep = "-"))
+  plist[[i]] <- pairwise_df %>%
+    filter(malecotf > 0 ) %>% 
+    ggplot() +
+    geom_beeswarm(aes(x = label_to_plt,
+                      y = malecotf)) + #,
+                 # outlier.shape=4,
+                 # outlier.size=10,
+                 # alpha = .8) +
+    ylab("IBD MLE Values") +
+    theme_bw() +
+    theme(axis.ticks.x = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(size = 40),
+          axis.text.y = element_text(size = 40),
+          axis.title.y = element_text(size = 35),
+          legend.position="none") +
+    scale_y_continuous(breaks=seq(0,1,0.1), limits = c(0,1))
+}
+
+plotrow1 <- plot_grid(plist[[1]],
+                      plist[[2]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      plist[[3]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      plist[[4]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ), 
+                      plist[[5]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ), 
+                      nrow = 1) 
+plotrow2 <- plot_grid(plist[[6]],
+                      plist[[7]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      plist[[8]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      plist[[9]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      NULL,
+                      nrow = 1) 
+plotrow3 <- plot_grid(plist[[10]],
+                      plist[[11]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      plist[[12]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      NULL,
+                      NULL,
+                      nrow = 1) 
+plotrow4 <- plot_grid(plist[[13]],
+                      plist[[14]] + theme(axis.text.y = element_blank(),
+                                    axis.ticks.y = element_blank(),
+                                    axis.title.y = element_blank() ),
+                      NULL,NULL,NULL,nrow = 1) 
+plotrow5 <- plot_grid(plist[[15]],
+                      NULL,NULL,NULL,NULL,nrow = 1)
+IBD_plt <- plot_grid(plotrow1,
+                     plotrow2,
+                     plotrow3,
+                     plotrow4,
+                     plotrow5,
+                     nrow = 5,
+                     byrow = TRUE,
+                     align = "v")
+ggsave(IBD_plt,file="results/IBD_kmeans.pdf",device = pdf, width = 35, height = 35, units = "in",bg = 'white')
+#pairwise_df <- do.call(rbind, datalist)
+```
+
+```{r Figure 1B}
+sample_ID_to_exclude_allinDAPC <- intersect(sample_ID_to_exclude_all,indNames(x))
+rand_samp <- sample(sample_ID_to_exclude_allinDAPC,1)
+sample_ID_to_exclude_inDAPC <- sample_ID_to_exclude_allinDAPC[sample_ID_to_exclude_allinDAPC != rand_samp]
+
+# collapse highly related to 1
+x_nohigh <- x[!(indNames(x) %in% sample_ID_to_exclude_inDAPC)]
+
+# only select Districts with 5 or more samples
+district_freq <- sample_names %>%
+  filter(ID %in% indNames(x_nohigh)) %>% 
+  group_by(District_N) %>%
+  #Frequencies of shehia
+  summarise(Freq=n()) %>% 
+  filter(Freq >= 5)
+
+# Districts and samples that met filter 
+samples_passed <- sample_names %>% 
+  filter(ID %in% indNames(x_nohigh)) %>% 
+  filter(District_N %in% district_freq$District_N)
+
+# select samples from districts with more than 5 samples
+x_nohigh <- x_nohigh[indNames(x_nohigh) %in% samples_passed$ID]
+
+# make a population based on all samples in analysis 
+pop(x_nohigh) <- as.factor(samples_passed$District_N)
+
+# for reproducibility, overall 
+set.seed(999)
+
+# by district
+mat <- tab(x_nohigh,NA.method = "mean")
+pramx <- xvalDapc(mat, pop(x_nohigh),n.rep=100,parallel="multicore",ncpus=3,xval.plot = TRUE)
+
+# lowest RMSE PC's
+pramx[2:6]
+PC_lowest <- as.numeric(pramx$`Number of PCs Achieving Lowest MSE`)
+
+dapc <- dapc(x_nohigh, var.contrib = TRUE, scale = FALSE, n.pca = 300, n.da = nPop(x))
+# highest a score is for 79
+# a score: simply the difference between the proportion of successful reassignment of
+#the analysis (observed discrimination) and values obtained using random groups (random
+#discrimination).
+temp <- optim.a.score(dapc) 
+
+#Keeping 80 PC's and making the dapc plot
+# stick with cross validation 
+# discriminant functions to retain (n.da) are the synthetic variables and they represent the populations in which to 
+# separate the data
+dapc <- dapc(x_nohigh, var.contrib = TRUE, scale = FALSE, n.pca = PC_lowest,n.da = nPop(x_nohigh))
+
+districts <- centroid_distinct %>% 
+  dplyr::select(-c(Shehia_match)) %>%
+  distinct() %>% 
+  na.omit() %>%  
+  dplyr::filter(District_N %in% district_freq$District_N) %>% 
+  group_by(District_N) %>% 
+  summarise_all(mean)
+
+library(paletteer)
+colfunc <- paletteer_d("RColorBrewer::Reds")
+colfunc <- c("#FC9272FF","#EF3B2CFF","#CB181DFF","#A50F15FF","#67000DFF")
+
+map <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.8, 40), ylim = c(-6.6,-4.8), expand = FALSE) +
+  geom_point(data = districts, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F,
+             color = c(colfunc[1:3],"#0066CC",colfunc[5]), shape = 15, size = 3) +
+  ggrepel::geom_label_repel(data = districts, aes(lon_centroid, lat_centroid, label = District_N), colour = c(colfunc[1:3],"#0066CC",colfunc[5]), label.size = 1) +
+  theme_void() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank()) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0, "in"))
+ggsave(map, file = "results/district_map_nohigh.pdf",device = pdf)
+
+pdf("results/DPAC_nohigh.pdf", width = 7.83, height = 6.07)
+DAPC <- scatter(dapc, 
+        cell = 0.5, 
+        cstar = 0, 
+        clab=0.7,
+        mstree = FALSE, 
+        scree.pca=FALSE,
+        posi.leg="topright", 
+        scree.da=FALSE,
+        grid=FALSE,
+        addaxes=FALSE,
+        col=c(colfunc[1:3],"#0066CC",colfunc[5]),
+        leg=TRUE)
+dev.off()
+
+# Create a data.frame containing individual coordinates
+ind_coords <- as.data.frame(dapc$ind.coord)
+
+# Rename columns of dataframe
+colnames(ind_coords) <- c("Axis1","Axis2","Axis3","Axis4")
+
+# Add a column containing individuals
+ind_coords$Ind <- indNames(x_nohigh)
+
+# Add a column with the site IDs
+ind_coords$Site <- x_nohigh$pop
+
+# Calculate centroid (average) position for each population
+centroid_DAPC <- aggregate(cbind(Axis1, Axis2, Axis3,Axis4) ~ Site, data = ind_coords, FUN = mean)
+
+# Add centroid coordinates to ind_coords dataframe
+ind_coords <- dplyr::left_join(ind_coords, 
+                        centroid_DAPC, 
+                        by = "Site",
+                        suffix = c("",".cen"))
+
+# Define colour palette
+cols <- c(colfunc[1:3],"#0066CC",colfunc[5])
+
+# percent variance explained by eigenvalues
+percent <- dapc$eig/sum(dapc$eig)*100
+
+# Custom x and y labels
+xlab <- paste("Discriminant Function  1 (", format(round(percent[1], 1), nsmall=1)," %)", sep="")
+ylab <- paste("Discriminant Function 2 (", format(round(percent[2], 1), nsmall=1)," %)", sep="")
+
+# Scatter plot axis 1 vs. 2
+DAPC_gg <- ggplot(data = ind_coords, aes(x = Axis1, y = Axis2)) +
+  # points
+  geom_point(aes(fill = Site), shape = 21, size = 3, show.legend = FALSE) +
+  # centroids
+  geom_label(data = centroid_DAPC, aes(label = Site, color = Site), size = 6, show.legend = FALSE) +
+  # colouring
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+  # custom labels
+  labs(x = xlab, y = ylab) +
+  theme(axis.text  = element_text(size=8),
+        axis.title = element_text(size=20))
+
+DAPC_nohigh <- cowplot::ggdraw() +
+  cowplot::draw_plot(DAPC_gg, x = 0, y = 0, width = 1, height = 1, scale = 1) +
+  cowplot::draw_plot(map, x = 0.682, y= 0.57, width = 0.4, height = 0.44)
+
+ggsave("results/DAPC_gg_nohigh.pdf", width = 10.3, height = 8)
+
+legend <- get_legend(PCA1and2_nohigh + theme(legend.box.margin = margin(0, 0, 0, 12)))
+Figure1A_PC <- plot_grid(NULL, 
+                      PCA1and2_nohigh + theme(legend.position="none"), 
+                      NULL,
+                      PCA1and3_nohigh + theme(legend.position="none"),
+                      # A negative rel_height shrinks space between elements
+                      rel_heights = c(0.1, 1, 0, 1),
+                      ncol = 1,
+                      label_y = 1.07,
+                      labels = c("","","",""),
+                      label_fontfamily = "sans")
+Figure1A_PC_leg <- plot_grid(Figure1A_PC,
+                             legend,
+                             ncol = 2,
+                             labels = c("",""),
+                             rel_widths = c(1, .4))
+
+Figure_1 <- plot_grid(NULL,
+                      Figure1A_PC_leg,
+                      NULL,
+                      DAPC_nohigh,
+                      labels = c("","A","","B"),
+                      rel_widths = c(0, 1, -0.15, 1),
+                      label_size = 18,
+                      nrow = 1)
+ggsave("results/Figure1.pdf", Figure_1,width = 21, height = 9)
+ggsave("results/Figure1.png", Figure_1,width = 21, height = 9)
+```
+
+
+```{r Supplemental Figure 3B}
+# only select Districts with 5 or more samples
+district_freq <- sample_names %>% 
+  group_by(District_N) %>%
+  #Frequencies of shehia
+  summarise(Freq=n()) %>% 
+  filter(Freq >= 5)
+
+# Districts and samples that met filter 
+samples_passed <- sample_names %>% 
+  filter(District_N %in% district_freq$District_N)
+
+# keep only samples that passed filter
+x <- x[indNames(x) %in% samples_passed$ID]
+
+# make a population based on all samples in analysis 
+pop(x) <- as.factor(samples_passed$District_N)
+
+# for reproducibility, overall 
+set.seed(999)
+
+# by district
+mat <- tab(x,NA.method = "mean")
+pramx <- xvalDapc(mat, pop(x),n.rep=100,parallel="multicore",ncpus=3,xval.plot = TRUE)
+
+# lowest RMSE PC's
+pramx[2:6]
+PC_lowest <- as.numeric(pramx$`Number of PCs Achieving Lowest MSE`)
+
+dapc <- dapc(x, var.contrib = TRUE, scale = FALSE, n.pca = 300, n.da = nPop(x))
+# highest a score is for 79
+# a score: simply the difference between the proportion of successful reassignment of
+#the analysis (observed discrimination) and values obtained using random groups (random
+#discrimination).
+temp <- optim.a.score(dapc) 
+
+#Keeping 80 PC's and making the dapc plot
+# stick with cross validation 
+# discriminant functions to retain (n.da) are the synthetic variables and they represent the populations in which to 
+# separate the data
+dapc <- dapc(x, var.contrib = TRUE, scale = FALSE, 
+             n.pca = PC_lowest,
+             n.da = nPop(x))
+
+districts <- centroid_distinct %>% 
+  dplyr::select(-c(Shehia_match)) %>%
+  distinct() %>% 
+  na.omit() %>%  
+  dplyr::filter(District_N %in% district_freq$District_N) %>% 
+  group_by(District_N) %>% 
+  summarise_all(mean)
+
+colfunc <- paletteer_d("RColorBrewer::Reds")
+colfunc <- c("#FC9272FF","#EF3B2CFF","#CB181DFF","#A50F15FF","#67000DFF")
+map <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.8, 40), ylim = c(-6.6,-4.8), expand = FALSE) +
+  geom_point(data = districts, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F,
+             color = c(colfunc[1:4],"#0066CC",colfunc[5]), shape = 15, size = 3) +
+  ggrepel::geom_label_repel(data = districts, aes(lon_centroid, lat_centroid, label = District_N), colour = c(colfunc[1:4],"#0066CC",colfunc[5]), label.size = 1) +
+  theme_void() +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank()) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_y = unit(0, "in"))
+ggsave(map, file = "results/district_map.pdf",device = pdf)
+
+# Create a data.frame containing individual coordinates
+ind_coords <- as.data.frame(dapc$ind.coord)
+
+# Rename columns of dataframe
+colnames(ind_coords) <- c("Axis1","Axis2","Axis3","Axis4","Axis5")
+
+# Add a column containing individuals
+ind_coords$Ind <- indNames(x)
+
+# Add a column with the site IDs
+ind_coords$Site <- x$pop
+
+# Calculate centroid (average) position for each population
+centroid_DAPC <- aggregate(cbind(Axis1, Axis2, Axis3,Axis4,Axis5) ~ Site, data = ind_coords, FUN = mean)
+
+# Add centroid coordinates to ind_coords dataframe
+ind_coords <- dplyr::left_join(ind_coords, 
+                        centroid_DAPC, 
+                        by = "Site",
+                        suffix = c("",".cen"))
+
+# Define colour palette
+cols <- c(colfunc[1:4],"#0066CC",colfunc[5])
+
+# percent variance explained by eigenvalues
+percent <- dapc$eig/sum(dapc$eig)*100
+
+# Custom x and y labels
+xlab <- paste("Discriminant Function 1 (", format(round(percent[1], 1), nsmall=1)," %)", sep="")
+ylab <- paste("Discriminant Function 2 (", format(round(percent[2], 1), nsmall=1)," %)", sep="")
+
+# Scatter plot axis 1 vs. 2
+DAPC_gg <- ggplot(data = ind_coords, aes(x = Axis1, y = Axis2)) +
+  # points
+  geom_point(aes(fill = Site), shape = 21, size = 3, show.legend = FALSE) +
+  # centroids
+  geom_label(data = centroid_DAPC, aes(label = Site, color = Site), size = 4, show.legend = FALSE) +
+  # colouring
+  scale_fill_manual(values = cols) +
+  scale_colour_manual(values = cols) +
+  # custom labels
+  labs(x = xlab, y = ylab) +
+  theme(axis.text  = element_text(size=15),
+        axis.title = element_text(size=25))
+
+DAPC <- cowplot::ggdraw() +
+  cowplot::draw_plot(DAPC_gg, x = 0, y = 0, width = 1, height = 1, scale = 1) +
+  cowplot::draw_plot(map, x = 0.52, y= 0.47, width = 0.6, height = 0.55)
+
+ggsave("results/DAPC_gg.pdf", DAPC, width = 8, height = 6, units = 'in')
+
+legend <- get_legend(PCA1and2 + theme(legend.box.margin = margin(0, 0, 0, 12)))
+FigureS4A_PC <- plot_grid(NULL, 
+                      PCA1and2 + theme(legend.position="none"), 
+                      NULL,
+                      PCA1and3 + theme(legend.position="none"),
+                      # A negative rel_height shrinks space between elements
+                      rel_heights = c(0.1, 1, 0, 1),
+                      ncol = 1,
+                      label_y = 1.07,
+                      labels = c("","","",""),
+                      label_fontfamily = "sans")
+FigureS4A_PC_leg <- plot_grid(FigureS4A_PC,
+                             legend,
+                             ncol = 2,
+                             labels = c("",""),
+                             rel_widths = c(1, .4))
+
+Figure_S4 <- plot_grid(NULL,
+                      FigureS4A_PC_leg,
+                      NULL,
+                      DAPC,
+                      labels = c("","A","","B"),
+                      rel_widths = c(0, 1, -0.15, 1),
+                      label_size = 18,
+                      nrow = 1)
+ggsave("results/FigureS4.pdf", Figure_S4,width = 14, height = 8)
+ggsave("results/FigureS4.png", Figure_S4,width = 14, height = 8)
+```
+
+#### Between Mainland and each island #####
+```{r Supplemental Figure 6}
+#xlim = c(39.1, 40), ylim = c(-5.6,-4.9)
+# subset between Zanzibar and Mainland with IBD of greater than 0.125
+shehia_analysis_both <- ibd_mle_long %>%
+  dplyr::filter(
+    (str_detect(Sample_Set_1, "ZAN") & str_detect(Sample_Set_2, "MAIN")) | 
+      (str_detect(Sample_Set_1, "MAIN") & str_detect(Sample_Set_2, "ZAN"))
+    ) %>% 
+  filter(malecotf >= 0.125)
+
+mtdtclst_both <- all_shehias %>% 
+  filter(Shehia_match %in% shehia_analysis_both$Shehia_match_1 | Shehia_match %in% shehia_analysis_both$Shehia_match_2)
+
+# find between pairs
+betweenpairs_both <- shehia_analysis_both %>% 
+  filter(Shehia_match_1 != Shehia_match_2)
+
+# both
+ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.8, 40), ylim = c(-6.5,-4.8), expand = FALSE) +
+  geom_curve(data = betweenpairs_both,
+             alpha = 0.5, size = 1.1,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), show.legend = T) +
+  scale_color_viridis_c("Between IBD", option="plasma", direction = 1, values = c(0,1)) +
+  # add label so you can see where extra mainland point is
+  geom_point(data = mtdtclst_both, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 2) +
+  theme_void() +
+  labs(colour = "Between IBD") +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+ggsave("results/both_0.125.pdf", device = pdf, width = 6, height = 7, units = "in", bg = 'white')
+```
+
+#### Within island #####
+```{r Figure 4 A and B}
+all_shehias <- centroid %>%
+  # no Shehia info for those two samples
+  dplyr::filter(
+    (!str_detect(ID, "ARA38"))) %>% 
+  dplyr::filter(
+    (!str_detect(ID, "HAF30"))) %>% 
+  dplyr::select(c("Shehia_match","lon_centroid", "lat_centroid","island")) %>%
+  dplyr::filter(!duplicated(.))
+
+# subset within Zanzibar and between siblings
+shehia_analysis <- ibd_mle_long %>%
+  dplyr::filter(
+    (str_detect(Sample_Set_1, "ZAN") & str_detect(Sample_Set_2, "ZAN"))) %>%
+  dplyr::filter(malecotf >= 0.25)
+
+mtdtclst <- all_shehias %>% 
+  filter(Shehia_match %in% shehia_analysis$Shehia_match_1 | Shehia_match %in% shehia_analysis$Shehia_match_2)
+
+# find between pairs
+betweenpairs <- shehia_analysis %>% 
+  filter(Shehia_match_1 != Shehia_match_2)
+
+# find within pair matches
+withinpairs <- shehia_analysis %>%
+  dplyr::filter(Shehia_match_1 == Shehia_match_2)
+
+# Unguja
+Unguja_coordinates <- mtdtclst %>% 
+  filter(lon_centroid > 39.1 & lon_centroid < 39.6 & lat_centroid > -6.5 & lat_centroid < -5.7)
+
+Unguja_coordinates_toplot <- Unguja_coordinates %>% 
+  dplyr::filter(Shehia_match == "SHAKANI")
+
+Unguja_plot <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.1, 39.6), ylim = c(-6.5,-5.7), expand = FALSE) +
+  geom_curve(data = betweenpairs,
+             alpha = 0.7, size = 2,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), 
+             show.legend = T) +
+  scale_color_viridis_c("Between IBD", 
+                        option="plasma", 
+                        direction = 1, 
+                        values = c(0,1)) +
+  geom_point(data = mtdtclst, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 4) +
+  ggnewscale::new_scale_color() +
+  geom_point(data = withinpairs, aes(x = lon_centroid_1, y = lat_centroid_1, colour = malecotf),
+             show.legend = T,
+             shape = 15, 
+             size = 6) +
+  scale_colour_gradientn(colours = c("#fee6ce",'#e6550d')) +
+  # add label that blue = high within pair freq
+  # ggrepel::geom_label_repel(data = Unguja_coordinates_toplot, aes(lon_centroid, lat_centroid, label = Shehia_match), colour = "black", label.size = 0.05,nudge_x = -.02,nudge_y = 0.02) +
+  theme_void() +
+  labs(colour = "Within IBD") +
+  theme(legend.text = element_text(size = 35),
+        legend.title = element_text(size = 45)) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+Unguja_plot
+ggsave("results/Unguja_0.25.pdf", plot = Unguja_plot,device = pdf, width = 6, height = 7, units = "in", bg = 'white')
+
+# Pemba
+Pemba_coordinates <- mtdtclst %>% 
+  filter(lon_centroid > 39.4 & lon_centroid < 40 & lat_centroid > -5.5 & lat_centroid < -4.8)
+
+Pemba_coordinates_toplot <- Pemba_coordinates %>% 
+  dplyr::filter(Shehia_match == "SHUMBA VIAMBONI")
+
+Pemba_plot <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.64, 39.9), ylim = c(-5.05,-4.85), expand = FALSE) +
+  geom_curve(data = betweenpairs,
+             alpha = 0.7, size = 2,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), show.legend = T) +
+  scale_color_viridis_c("Between IBD", option="plasma", direction = 1, values = c(0,1)) +
+  geom_point(data = mtdtclst, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 4) +
+  ggnewscale::new_scale_color() +
+  geom_point(data = withinpairs, aes(x = lon_centroid_1, y = lat_centroid_1, color = malecotf),
+             show.legend = T,
+             shape = 15, size = 6) +
+  scale_colour_gradientn(colours = c("#fee6ce",'#e6550d')) +
+  # ggrepel::geom_label_repel(data = Pemba_coordinates_toplot, aes(lon_centroid, lat_centroid, label = Shehia_match), colour = "black", label.size = 0.05, nudge_x = -0.02) +
+  theme_void() +
+  labs(colour = "Within IBD") +
+  theme(legend.text = element_text(size = 35),
+        legend.title = element_text(size = 45)) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+Pemba_plot
+ggsave("results/Pemba_0.25.pdf", plot = Pemba_plot,device = pdf, width = 6, height = 7, units = "in", dpi = 300, bg = 'white')
+
+cowplot::plot_grid(Unguja_plot,
+                   Pemba_plot)
+
+ggsave("results/Zanzibar_IBD_geo_0.25.pdf", device = pdf, width = 20, height = 20, units = "in", bg = 'white')
+```
+
+```{r}
+# add extra island label to metadata doc
+centroid <- 
+  centroid %>% 
+  dplyr::mutate(island = if_else(lon_centroid > 39.1 & lon_centroid < 39.6 & lat_centroid > -6.5 & lat_centroid < -5.7, "Unguja",
+                          if_else(lon_centroid > 39.4 & lon_centroid < 40 & lat_centroid > -5.5 & lat_centroid < -4.8, "Pemba","Mainland")))
+write_csv(centroid,"data/metadata/centroid_island.csv")
+```
+
+#### Between island #####
+```{r Supplemental Figure 7}
+#xlim = c(39.1, 40), ylim = c(-5.6,-4.9)
+# subset between Unguja and Pemba with IBD of greater than 0.125
+shehia_analysis_islands <- ibd_mle_long %>%
+  dplyr::filter(
+    (str_detect(island_1, "Pemba") & str_detect(island_2, "Unguja")) | 
+      (str_detect(island_1, "Unguja") & str_detect(island_2, "Pemba"))
+    ) %>% 
+  filter(malecotf >= 0.125)
+
+mtdtclst_islands <- all_shehias %>% 
+  filter(Shehia_match %in% shehia_analysis_islands$Shehia_match_1 | Shehia_match %in% shehia_analysis_islands$Shehia_match_2)
+
+# find between pairs
+betweenpairs_islands <- shehia_analysis_islands %>% 
+  filter(Shehia_match_1 != Shehia_match_2)
+
+# both
+ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(38.8, 40), ylim = c(-6.5,-4.8), expand = FALSE) +
+  geom_curve(data = betweenpairs_islands,
+             alpha = 0.5, size = 1.1,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), show.legend = T) +
+  scale_color_viridis_c("Between IBD", option="plasma", direction = 1, values = c(0,1)) +
+  # add label so you can see where extra mainland point is
+  geom_point(data = mtdtclst_islands, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 2) +
+  theme_void() +
+  labs(colour = "Between IBD") +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+ggsave("results/between_islands_0.125.pdf", device = pdf, width = 6, height = 7, units = "in", bg = 'white')
+```
+#### Network Analysis In Pemba
+
+```{r Figure 4C}
+getPalette <- brewer.pal(6,"Set2")
+
+# subset by cousins and in Shehias in northern Pemba
+shehia_analysis_Pemba <- ibd_mle_long %>%
+  filter(island_1 == "Pemba" & island_2 == "Pemba") %>% 
+  dplyr::filter(malecotf >= 0.25)
+
+#IDs <- c("AKR19","FNK18","HRH12","HAB16","MHH2","FAH13")
+#IDs <- c("SAJ28","JAJ29","FMZ4")
+IDs <- c("AKR19","FNK18","HRH12","HAB16","MHH2","FAH13","FMH42","OHO27","SAJ28","JAJ29","FMZ4")
+mean_calc <- shehia_analysis_Pemba %>%
+  filter(smpl1 %in% IDs | smpl2 %in% IDs)
+mean(mean_calc$malecotf)
+
+# contains all shehias in analysis
+unique_shehias <- unique(c(unique(shehia_analysis_Pemba$Shehia_match_1),unique(shehia_analysis_Pemba$Shehia_match_2)))
+sample_metadata <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Pemba$smpl1),unique(shehia_analysis_Pemba$smpl2))))
+names(getPalette) <- unique_shehias
+
+Pemba_net <- shehia_analysis_Pemba %>%
+  tidygraph::as_tbl_graph(.,directed = F) %>%
+  tidygraph::activate("nodes") %>%
+  dplyr::left_join(sample_metadata, by = c("name" = "ID")) %>% 
+  #tidygraph::activate("edges") %>%
+  ggraph::ggraph(layout = 'kk') +
+  ggraph::geom_edge_link(aes(width = malecotf,
+                             color = malecotf)) +
+  ggraph::geom_node_point(aes(color = Shehia_match),
+                          size = 10) +
+  ggraph::scale_edge_width_continuous(range = c(0.25, 1), guide = "none") +
+  ggraph::geom_node_text(aes(label = name), 
+                         repel = T,
+                         size = 6) +
+  ggraph::scale_edge_colour_viridis("IBD", begin = 0.5, end = 1, option = "plasma",
+                                    guide = guide_colorbar(available_aes = "edge_colour")) +
+  scale_color_manual(values = getPalette,
+                    name = "Shehia") +
+  ggraph::theme_graph(base_size = 20) +
+  theme(legend.position = "bottom")
+Pemba_net
+ggsave("results/connectivity_0.25_or_greater_Pemba.pdf", device = pdf, width = 10, height = 10, units = "in")
+
+# select 6 shehias to plot 
+Shehias_to_plot <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match,lon_centroid,lat_centroid)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Pemba$smpl1),unique(shehia_analysis_Pemba$smpl2)))) %>% 
+  dplyr::select(-ID) %>% 
+  unique(.)
+
+# Pemba map_colored by Shehia
+Pemba_shehia_color <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.64, 39.9), ylim = c(-5.05,-4.85), expand = FALSE) +
+  geom_point(data = Shehias_to_plot, aes(x = lon_centroid, y = lat_centroid, color = Shehia_match),
+             show.legend = F,
+             color = getPalette, shape = 15, size = 12) +
+  ggrepel::geom_label_repel(data = Shehias_to_plot, aes(lon_centroid, lat_centroid, label = Shehia_match, colour = Shehia_match), colour = getPalette, size = 8, label.size = NA,
+                            nudge_x = -0.001, 
+                            nudge_y = -0.001
+                            ) +
+  theme_void()
+
+library(patchwork)
+# arrange plots
+Pemba_grob <- ggplotGrob(Pemba_shehia_color)
+Pemba_net + 
+  annotation_custom(grob = Pemba_grob, 
+                      xmin = 1, xmax = 2, ymin=-6, ymax=3)
+
+combined <- Pemba_net + 
+  inset_element(Pemba_shehia_color, 
+                left = 0.1, 
+                bottom = 0.2, 
+                right = 0.95, 
+                top = 0.55)
+ggsave("results/shehia_map_network.pdf", device = pdf,width = 10, height = 10, units = "in", dpi = 300)
+
+islands <- Unguja_plot/Pemba_plot +
+  plot_layout(heights = c(3,1))
+patch <- (islands | combined) + 
+  plot_layout(nrow = 1, 
+              ncol = 2, 
+              widths = c(1.5, 3))
+ggsave(file="results/Zanzibar_IBD_geo_0.25_net_withmap.pdf", patch,device = pdf, width = 30, height = 20, units = "in", bg = 'white')
+
+plot <- grid.arrange(arrangeGrob(Unguja_plot, Pemba_plot),
+             Pemba_net,
+             nrow = 1,
+             widths=c(2,4)
+             )
+ggsave(file="results/Zanzibar_IBD_geo_0.25_net_withoutmap.pdf", plot,device = pdf, width = 30, height = 20, units = "in", bg = 'white')
+```
+
+```{r Figure 4C revised}
+library(colorspace)
+Unguja_plot <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.1, 39.6), ylim = c(-6.5,-5.7), expand = FALSE) +
+  geom_curve(data = betweenpairs,
+             alpha = 0.7, size = 2,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), 
+             show.legend = T) +
+  scale_color_viridis_c("Between IBD", 
+                        option="plasma", 
+                        direction = 1, 
+                        values = c(0,1)) +
+  geom_point(data = mtdtclst, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 4) +
+  ggnewscale::new_scale_color() +
+  geom_point(data = withinpairs, aes(x = lon_centroid_1, y = lat_centroid_1, colour = malecotf),
+             show.legend = T,
+             shape = 15, 
+             size = 6) +
+  #scale_colour_continuous_sequential(palette = "Greens") +
+  scale_colour_gradient(low='grey80',high='dark green') + 
+  # add label that blue = high within pair freq
+  # ggrepel::geom_label_repel(data = Unguja_coordinates_toplot, aes(lon_centroid, lat_centroid, label = Shehia_match), colour = "black", label.size = 0.05,nudge_x = -.02,nudge_y = 0.02) +
+  theme_void() +
+  labs(colour = "Within IBD") +
+  theme(legend.text = element_text(size = 30),
+        legend.title = element_text(size = 45)) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+Unguja_plot
+ggsave("results/Unguja_0.25_revised.pdf", plot = Unguja_plot,device = pdf, width = 10, height = 10, units = "in", dpi = 300, bg = 'white')
+
+Pemba_plot <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.64, 39.9), ylim = c(-5.05,-4.85), expand = FALSE) +
+  geom_curve(data = betweenpairs,
+             alpha = 0.7, size = 2,
+             aes(x = lon_centroid_1, y = lat_centroid_1,
+                 xend = lon_centroid_2, yend = lat_centroid_2,
+                 color = malecotf), show.legend = T) +
+  scale_color_viridis_c("Between IBD", option="plasma", direction = 1, values = c(0,1)) +
+  geom_point(data = mtdtclst, aes(x = lon_centroid, y = lat_centroid),
+             show.legend = F, size = 4) +
+  ggnewscale::new_scale_color() +
+  geom_point(data = withinpairs, aes(x = lon_centroid_1, y = lat_centroid_1, color = malecotf),
+             show.legend = T,
+             shape = 15, size = 6) +
+  #scale_colour_continuous_sequential(palette = "Greens) +
+  scale_colour_gradient(low='grey80',high='dark green') + 
+  #scale_colour_gradientn(colours = c("#fee6ce",'#e6550d')) +
+  # ggrepel::geom_label_repel(data = Pemba_coordinates_toplot, aes(lon_centroid, lat_centroid, label = Shehia_match), colour = "black", label.size = 0.05, nudge_x = -0.02) +
+  theme_void() +
+  labs(colour = "Within IBD") +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in")) +
+  theme(legend.text = element_text(size = 30),
+        legend.title = element_text(size = 45))
+Pemba_plot
+ggsave("results/Pemba_0.25_revised.pdf", plot = Pemba_plot,device = pdf, width = 10, height = 10, units = "in", dpi = 300, bg = 'white')
+
+Pemba_net <- shehia_analysis_Pemba %>%
+  tidygraph::as_tbl_graph(.,directed = F) %>%
+  tidygraph::activate("nodes") %>%
+  dplyr::left_join(sample_metadata, by = c("name" = "ID")) %>% 
+  #tidygraph::activate("edges") %>%
+  ggraph::ggraph(layout = 'kk') +
+  ggraph::geom_edge_link(aes(width = malecotf,
+                             color = malecotf)) +
+  ggraph::geom_node_point(aes(color = Shehia_match),
+                          size = 10) +
+  ggraph::scale_edge_width_continuous(range = c(0.25, 1), guide = "none") +
+  ggraph::geom_node_text(aes(label = name), 
+                         repel = T,
+                         size = 6) +
+  scale_color_manual(values = getPalette,
+                     name = "Shehia") +
+  ggraph::scale_edge_colour_viridis("IBD", 
+                                    begin = 0.25, 
+                                    end = 1, 
+                                    option = "plasma",
+                                    guide = guide_colorbar(available_aes = "edge_colour")) +
+  theme_graph() +
+  theme(legend.position = "bottom",text = element_text(size = 14,family = "sans")) 
+
+ggsave("results/connectivity_0.25_or_greater_Pemba.pdf", device = pdf, width = 10, height = 10,units = "in")
+
+# select 6 shehias to plot 
+Shehias_to_plot <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match,lon_centroid,lat_centroid)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Pemba$smpl1),unique(shehia_analysis_Pemba$smpl2)))) %>% 
+  dplyr::select(-ID) %>% 
+  unique(.)
+
+# Pemba map_colored by Shehia
+Pemba_shehia_color <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.64, 39.9), ylim = c(-5.05,-4.85), expand = FALSE) +
+  geom_point(data = Shehias_to_plot, aes(x = lon_centroid, y = lat_centroid, color = Shehia_match),
+             show.legend = F,
+             color = getPalette, shape = 15, size = 12) +
+  # ggrepel::geom_label_repel(data = Shehias_to_plot, 
+  #                           aes(lon_centroid, lat_centroid, label = Shehia_match, colour = Shehia_match), 
+  #                           colour = getPalette, 
+  #                           size = 8, 
+  #                           label.size = NA,
+  #                           nudge_x = -0.001, 
+  #                           nudge_y = -0.001
+  #                           ) +
+  theme_void() +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+
+combined <- Pemba_net + 
+  inset_element(Pemba_shehia_color, 
+                left = 0.1, 
+                bottom = 0.2, 
+                right = 0.95, 
+                top = 0.63)
+combined
+ggsave("results/shehia_map_network.pdf", device = pdf,width = 10, height = 10, units = "in", dpi = 300)
+```
+
+#### Network Analysis Within Unguja
+```{r Supplemental Figure 9}
+# subset by cousins and in Shehias in northern Pemba
+shehia_analysis_Unguja <- ibd_mle_long %>%
+  filter(island_1 == "Unguja" & island_2 == "Unguja") %>% 
+  filter(Shehia_match_1 == Shehia_match_2) %>% 
+  dplyr::filter(malecotf >= 0.25)
+
+# contains all shehias in analysis
+unique_shehias <- unique(c(unique(shehia_analysis_Unguja$Shehia_match_1),unique(shehia_analysis_Unguja$Shehia_match_2)))
+sample_metadata <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Unguja$smpl1),unique(shehia_analysis_Unguja$smpl2))))
+
+library(colorspace)
+library(qualpalr)
+#getPalette <- brewer.pal(length(unique_shehias),"RdGy")
+#getPalette <- colorRampPalette(getPalette)(length(unique_shehias))
+pal <- qualpal(length(unique_shehias), colorspace=list(h=c(0,360), s=c(0.3,1), l=c(0.2,0.8)))
+getPalette <- pal$hex
+names(getPalette) <- unique_shehias
+
+Unguja_net <- shehia_analysis_Unguja %>%
+  tidygraph::as_tbl_graph(.,directed = F) %>%
+  tidygraph::activate("nodes") %>%
+  dplyr::left_join(sample_metadata, by = c("name" = "ID")) %>% 
+  #tidygraph::activate("edges") %>%
+  ggraph::ggraph(layout = 'kk') +
+  ggraph::geom_edge_link(aes(width = malecotf,
+                             color = malecotf)) +
+  ggraph::geom_node_point(aes(color = Shehia_match),
+                          size = 20) +
+  ggraph::scale_edge_width_continuous(range = c(2.5, 10), 
+                                      guide = "none") +
+  ggraph::geom_node_text(aes(label = name), 
+                         repel = T,
+                         size = 10,
+                         nudge_x = 0.2) +
+  ggraph::scale_edge_colour_viridis("IBD", begin = 0.5, end = 1, option = "plasma",
+                                    guide = guide_colorbar(available_aes = "edge_colour")) +
+  scale_color_manual(values = getPalette,
+                    name = "Shehia") +
+  ggraph::theme_graph(base_size = 30) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 40),
+        legend.title = element_text(size = 40),
+        legend.key.size = unit(10,"line"))
+  
+Unguja_net
+
+# select shehias to plot 
+Shehias_to_plot <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match,lon_centroid,lat_centroid)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Unguja$smpl1),unique(shehia_analysis_Unguja$smpl2)))) %>% 
+  dplyr::select(-ID) %>% 
+  unique(.)
+
+# Pemba map_colored by Shehia
+Unguja_shehia_color <- ggplot() +
+  geom_sf(data = tanzania_map) +
+  coord_sf(xlim = c(39.1, 39.6), ylim = c(-6.5,-5.7), expand = FALSE) +
+  geom_point(data = Shehias_to_plot, aes(x = lon_centroid, y = lat_centroid, color = Shehia_match),
+             show.legend = T,
+             shape = 15, 
+             size = 10) +
+  scale_color_manual(name = "Shehia", values = getPalette) +
+  theme_void() +
+  theme(text = element_text(size=28)) +
+  annotation_scale(location = "br",width_hint = 0.25, pad_x = unit(0.0, "in"))
+ggsave(Unguja_shehia_color, file = "results/map_Unguja.pdf", device = pdf, width = 10, height = 10, units = "in")
+
+# arrange plots
+combined <- cowplot::plot_grid(Unguja_shehia_color,
+                               Unguja_net,
+                               nrow = 2,
+                               ncol = 1,
+                               rel_heights = c(0.5,1),
+                               labels = c("A","B"),
+                               label_fontfamily = "Arial Narrow",
+                               label_size = 30) +
+  theme(plot.background = element_rect(fill="white", color = NA))
+                               
+ggsave(combined, file = "results/map_net_Unguja.pdf", device = pdf, width = 35, height = 49, units = "in")
+ggsave(combined, file = "results/map_net_Unguja.png", device = png, width = 35, height = 49, units = "in")
+
+shehia_analysis_Unguja %>%
+  tidygraph::as_tbl_graph(.,directed = F) %>%
+  tidygraph::activate("nodes") %>%
+  dplyr::left_join(sample_metadata, by = c("name" = "ID")) %>% 
+  #tidygraph::activate("edges") %>%
+  ggraph::ggraph(layout = 'kk') +
+  ggraph::geom_edge_link(aes(width = malecotf,
+                             color = malecotf)) +
+  ggraph::geom_node_point(aes(color = Shehia_match),
+                          size = 20) +
+  ggraph::scale_edge_width_continuous(range = c(0.25, 1), guide = "none") +
+  ggraph::geom_node_text(aes(label = name), 
+                         repel = T,
+                         size = 10,
+                         nudge_x = 0.25,
+                         nudge_y = 0.2) +
+  ggraph::scale_edge_colour_viridis("IBD", begin = 0.5, end = 1, option = "plasma",
+                                    guide = guide_colorbar(available_aes = "edge_colour")) +
+  scale_color_manual(values = getPalette,
+                    name = "Shehia") +
+  ggraph::theme_graph(base_size = 30) +
+  theme(legend.position = "bottom")
+ggsave("results/connectivity_0.25_or_greater_Unguja.pdf", device = pdf, width = 30, height = 30, units = "in")
+```
+
+#### Network Analysis Within Mainland
+```{r Supplemental Figure 10}
+# subset by cousins and in Shehias in northern Pemba
+shehia_analysis_Mainland <- ibd_mle_long %>%
+  filter(island_1 == "Mainland" & island_2 == "Mainland") %>% 
+  dplyr::filter(malecotf >= 0.25)
+
+# contains all shehias in analysis
+unique_shehias <- unique(c(unique(shehia_analysis_Mainland$Shehia_match_1),unique(shehia_analysis_Mainland$Shehia_match_2)))
+sample_metadata <- centroid %>% 
+  dplyr::select(c(ID,Shehia_match)) %>% 
+  dplyr::filter(ID %in% unique(c(unique(shehia_analysis_Mainland$smpl1),unique(shehia_analysis_Mainland$smpl2))))
+
+library(colorspace)
+library(qualpalr)
+getPalette <- "#2538be"
+names(getPalette) <- unique_shehias
+
+shehia_analysis_Mainland %>%
+  tidygraph::as_tbl_graph(.,directed = F) %>%
+  tidygraph::activate("nodes") %>%
+  dplyr::left_join(sample_metadata, by = c("name" = "ID")) %>% 
+  #tidygraph::activate("edges") %>%
+  ggraph::ggraph(layout = 'kk') +
+  ggraph::geom_edge_link(aes(width = malecotf,
+                             color = malecotf)) +
+  ggraph::geom_node_point(color = getPalette,
+                          size = 20) +
+  ggraph::scale_edge_width_continuous(range = c(2.5, 10), 
+                                      guide = "none") +
+  ggraph::geom_node_text(aes(label = name), 
+                         repel = T,
+                         size = 15,
+                         nudge_y = -0.22) +
+  ggraph::scale_edge_colour_viridis("IBD", begin = 0.5, end = 1, option = "plasma",
+                                    guide = guide_colorbar(available_aes = "edge_colour")) +
+  ggraph::theme_graph(base_size = 20) +
+  theme(legend.position = "right",
+        legend.text = element_text(size = 40),
+        legend.title = element_text(size = 40),
+        legend.key.size = unit(10,"line"))
+
+ggsave("results/connectivity_0.25_or_greater_mainland.pdf", device = pdf, width = 40, height = 40, units = "in")
+ggsave("results/connectivity_0.25_or_greater_mainland.png", device = png, width = 40, height = 40, units = "in")
+```
+
+#### Isolation by distance
+
+```{r}
+# calculate and store great circle distance
+# distances between lat on x and lon on y
+mipvcf_Zanzibar <- mipvcf$samples %>% 
+  filter(
+    str_detect(Sample_Set, 'ZAN')) %>% 
+  # remove two samples without shehia information
+  filter(!(ID %in% c("ARA38","HAF30")))
+
+mipvcf_spatial <- get_spatial_distance(mipvcf_Zanzibar$lat_centroid, mipvcf_Zanzibar$lon_centroid)
+
+# tidy result
+colnames(mipvcf_spatial) <- rownames(mipvcf_spatial) <- mipvcf_Zanzibar$ID
+spatial_long <- broom::tidy(as.dist(mipvcf_spatial)) %>%  
+  magrittr::set_colnames(c("smpl1", "smpl2", "spdist")) 
+
+# distances added to ibd df
+ibd_mle_long_dist <- ibd_mle_long %>% 
+  filter(str_detect(Sample_Set_1, 'ZAN') & str_detect(Sample_Set_2, 'ZAN')) %>% 
+  dplyr::left_join(., spatial_long, by = c("smpl1", "smpl2")) %>%
+  dplyr::mutate(spdist = ifelse(is.na(spdist), 0, spdist))
+
+# bin distances
+ibd_mle_long_dist$spdist_cat <- 
+  cut(x = c(ibd_mle_long_dist$spdist), 
+      breaks = c(0, 1e-26, seq(10, 40, by = 10), Inf),
+      right = F, 
+      labels = c("Within", paste(seq(10, 40, by = 10),"km"),">40km"))
+
+plotdat <- ibd_mle_long_dist %>%
+  dplyr::group_by(spdist_cat) %>%
+  dplyr::summarise(
+    n = n(),
+    meanIBD = mean(malecotf),
+    sdIBD = sd(malecotf),
+    seIBD = sdIBD/sqrt(n),
+    U95CI = meanIBD + 1.96 * seIBD,
+    L95CI = meanIBD - 1.96 * seIBD) 
+
+main_Zanzibar <- plotdat %>% 
+  ggplot() +
+  geom_pointrange(aes(x = spdist_cat, y = meanIBD, ymin = L95CI, ymax = U95CI),
+                  #fatten = 20,
+                  size=3
+                  ) +
+  scale_size(range = c(0, max(plotdat$U95CI)+0.01)) +
+  scale_y_continuous(breaks=seq(0,max(plotdat$U95CI)+0.01,0.02)) +
+  labs(y = "Mean IBD", x = "Spatial Separation") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 55),
+        axis.text.y = element_text(size = 55),
+        axis.title.y = element_text(size = 55),
+        axis.title = element_text(size = 65))
+main_Zanzibar
+
+# bin distances for inset 
+ibd_mle_long_dist$spdist_cat <- 
+  cut(x = c(ibd_mle_long_dist$spdist), 
+      breaks = c(0, 1e-26, seq(4, 12, by = 4),Inf),
+      right = F, 
+      labels = c("Within", paste(seq(4, 12, by = 4),"km"),">12km"))
+
+plotdat_inset <- ibd_mle_long_dist %>%
+  filter(!(spdist_cat == ">12km")) %>% 
+  dplyr::group_by(spdist_cat) %>%
+  dplyr::summarise(
+    n = n(),
+    meanIBD = mean(malecotf),
+    sdIBD = sd(malecotf),
+    seIBD = sdIBD/sqrt(n),
+    U95CI = meanIBD + 1.96 * seIBD,
+    L95CI = meanIBD - 1.96 * seIBD) 
+
+inset_Zanzibar <- plotdat_inset %>% 
+  ggplot() +
+  geom_pointrange(aes(x = spdist_cat, y = meanIBD, ymin = L95CI, ymax = U95CI),
+                  #fatten = 2,
+                  size=3) +
+  scale_size(range = c(0, max(plotdat$U95CI)+0.01)) +
+  scale_y_continuous(breaks=seq(0,max(plotdat$U95CI)+0.01,0.02)) +
+  labs(y = "Mean IBD", x = "Spatial Separation") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 55),
+        axis.text.y = element_text(size = 55),
+        axis.title.y = element_text(size = 55),
+        axis.title = element_text(size = 65))
+inset_Zanzibar
+```
+
+#### isolation by distance in Unguja
+```{r}
+# Unguja coordinates
+Unguja_shehia_coor <- centroid %>% 
+  filter(island == "Unguja") %>% 
+  select(c(Shehia_match,lat_centroid,lon_centroid)) %>% 
+  distinct()
+
+mipvcf_Unguja <- mipvcf$samples %>% 
+  filter(island == "Unguja")
+
+# calculate and store great circle distance
+# distances between lat on x and lon on y
+mipvcf_spatial <- get_spatial_distance(mipvcf_Unguja$lat_centroid,
+                                       mipvcf_Unguja$lon_centroid)
+
+# tidy result
+colnames(mipvcf_spatial) <- rownames(mipvcf_spatial) <- mipvcf_Unguja$ID
+spatial_long <- broom::tidy(as.dist(mipvcf_spatial)) %>%  
+  magrittr::set_colnames(c("smpl1", "smpl2", "spdist")) 
+
+# distances added to ibd df
+ibd_mle_long_dist <- ibd_mle_long %>% 
+  # filter within Unguja
+  dplyr::filter(island_1 == "Unguja" & island_2 == "Unguja") %>% 
+  # join by the pair distances
+  dplyr::left_join(., spatial_long, by = c("smpl1", "smpl2")) %>%
+  # add distance
+  dplyr::mutate(spdist = ifelse(is.na(spdist), 0, spdist))
+
+# bin distances
+ibd_mle_long_dist$spdist_cat <- 
+  cut(x = c(ibd_mle_long_dist$spdist), 
+      breaks = c(0, 1e-26, seq(10,40, by = 10),Inf),
+      right = F, 
+      labels = c("Within", paste(seq(10, 40, by = 10),"km"),">40km"))
+
+plotdat <- ibd_mle_long_dist %>%
+  dplyr::group_by(spdist_cat) %>%
+  dplyr::summarise(
+    n = n(),
+    meanIBD = mean(malecotf),
+    sdIBD = sd(malecotf),
+    seIBD = sdIBD/sqrt(n),
+    U95CI = meanIBD + 1.96 * seIBD,
+    L95CI = meanIBD - 1.96 * seIBD) 
+
+main_Unguja <- plotdat %>% 
+  ggplot() +
+  geom_pointrange(aes(x = spdist_cat, y = meanIBD, ymin = L95CI, ymax = U95CI),
+                  #fatten = 20,
+                  size=3
+                  ) +
+  scale_size(range = c(0, 0.14)) +
+  scale_y_continuous(breaks=seq(0,0.14,0.02),limits = c(0, 0.14)) +
+  labs(y = "Mean IBD", x = "Spatial Separation") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 55),
+        axis.text.y = element_text(size = 55),
+        axis.title.y = element_text(size = 55),
+        axis.title = element_text(size = 65))
+main_Unguja
+
+# bin distances for inseet 
+ibd_mle_long_dist$spdist_cat <- 
+  cut(x = c(ibd_mle_long_dist$spdist), 
+      breaks = c(0, 1e-26, seq(4, 12, by = 4),Inf),
+      right = F, 
+      labels = c("Within", paste(seq(4, 12, by = 4),"km"),">12km"))
+
+plotdat_inset <- ibd_mle_long_dist %>%
+  filter(!(spdist_cat == ">12km")) %>% 
+  dplyr::group_by(spdist_cat) %>%
+  dplyr::summarise(
+    n = n(),
+    meanIBD = mean(malecotf),
+    sdIBD = sd(malecotf),
+    seIBD = sdIBD/sqrt(n),
+    U95CI = meanIBD + 1.96 * seIBD,
+    L95CI = meanIBD - 1.96 * seIBD) 
+
+inset_Unguja <- plotdat_inset %>% 
+  ggplot() +
+  geom_pointrange(aes(x = spdist_cat, y = meanIBD, ymin = L95CI, ymax = U95CI),
+                  #fatten = 2,
+                  size=3) +
+  scale_size(range = c(0, 0.14)) +
+  scale_y_continuous(breaks=seq(0,0.14,0.02),limits = c(0, 0.14)) +
+  labs(y = "Mean IBD", x = "Spatial Separation") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 55),
+        axis.text.y = element_text(size = 55),
+        axis.title.y = element_text(size = 55),
+        axis.title = element_text(size = 65))
+inset_Unguja
+```
+
+# Isolation by distance Pemba and creation of figures
+```{r Figure 3 and Supplemental Figure 8}
+# Pemba coordinates
+Pemba_shehia_coor <- centroid %>% 
+  filter(island == "Pemba") %>% 
+  select(c(Shehia_match,lat_centroid,lon_centroid)) %>% 
+  distinct() %>% 
+  # remove shehia info that is missing for two samples
+  na.omit()
+
+mipvcf_Pemba <- mipvcf$samples %>% 
+  filter(island == "Pemba") %>% 
+  # remove two samples without shehia information
+  filter(!(ID %in% c("ARA38","HAF30")))
+
+# calculate and store great circle distance
+# distances between lat on x and lon on y
+mipvcf_spatial <- get_spatial_distance(mipvcf_Pemba$lat_centroid,
+                                       mipvcf_Pemba$lon_centroid)
+
+# tidy result
+colnames(mipvcf_spatial) <- rownames(mipvcf_spatial) <- mipvcf_Pemba$ID
+spatial_long <- broom::tidy(as.dist(mipvcf_spatial)) %>%  
+  magrittr::set_colnames(c("smpl1", "smpl2", "spdist")) 
+
+# distances added to ibd df
+ibd_mle_long_dist <- ibd_mle_long %>% 
+  # filter within Unguja
+  dplyr::filter(island_1 == "Pemba" & island_2 == "Pemba") %>% 
+  # join by the pair distances
+  dplyr::left_join(., spatial_long, by = c("smpl1", "smpl2")) %>%
+  # add distance
+  dplyr::mutate(spdist = ifelse(is.na(spdist), 0, spdist))
+
+# bin distances
+ibd_mle_long_dist$spdist_cat <- 
+  cut(x = c(ibd_mle_long_dist$spdist), 
+      breaks = c(0, 1e-26, seq(4,12, by = 4)),
+      right = F, 
+      labels = c("Within", paste(seq(4, 12, by = 4),"km")))
+
+plotdat <- ibd_mle_long_dist %>%
+  dplyr::group_by(spdist_cat) %>%
+  dplyr::summarise(
+    n = n(),
+    meanIBD = mean(malecotf),
+    sdIBD = sd(malecotf),
+    seIBD = sdIBD/sqrt(n),
+    U95CI = meanIBD + 1.96 * seIBD,
+    L95CI = meanIBD - 1.96 * seIBD) 
+
+main_Pemba <- plotdat %>% 
+  ggplot() +
+  geom_pointrange(aes(x = spdist_cat, y = meanIBD, ymin = L95CI, ymax = U95CI),
+                  #fatten = 20,
+                  size=3
+                  ) +
+  scale_size(range = c(0, 0.12)) +
+  scale_y_continuous(breaks=seq(0,0.12,0.02),limits = c(0,0.12)) +
+  labs(y = "Mean IBD", x = "Spatial Separation") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 55),
+        axis.text.y = element_text(size = 55),
+        axis.title.y = element_text(size = 55),
+        axis.title = element_text(size = 65))
+main_Pemba
+```
+
+```{r}
+common_theme <- theme_classic() +
+  theme(axis.text = element_text(size = 55, family = "sans"),
+        axis.text.y = element_text(size = 55, family = "sans"),
+        axis.title.y = element_text(size = 55, family = "sans"),
+        axis.title = element_text(size = 65, family = "sans"))
+
+# Apply this theme to all individual plots
+main_Zanzibar <- main_Zanzibar + common_theme
+main_Unguja <- main_Unguja + common_theme
+main_Pemba <- main_Pemba + common_theme
+inset_Zanzibar <- inset_Zanzibar + common_theme
+inset_Unguja <- inset_Unguja + common_theme
+
+combined_plot_all <- plot_grid(
+  inset_Zanzibar,
+  inset_Unguja,
+  main_Pemba,
+  nrow = 3,
+  labels = c('A', 'B', 'C'),
+  label_size = 50,
+  align = 'v'
+) 
+
+combined_plot_sup <- plot_grid(
+  main_Zanzibar,
+  main_Unguja,
+  nrow = 2,
+  labels = c('A', 'B'),
+  label_size = 50,
+  align = 'v'
+) + xlab("Spatial Separation")
+
+# Save the combined plots
+ggsave("results/isolation_by_distance_all.pdf", combined_plot_all, device = "pdf", width = 35, height = 35, units = 'in')
+ggsave("results/isolation_by_distance_sup.pdf", combined_plot_sup, device = "pdf", width = 35, height = 35, units = 'in')
+ggsave("results/isolation_by_distance_all.png", combined_plot_all, device = "png", width = 35, height = 35, units = 'in')
+ggsave("results/isolation_by_distance_sup.png", combined_plot_sup, device = "png", width = 35, height = 35, units = 'in')
+```
+
