@@ -6,7 +6,7 @@ The MIPAnalyzer objects and vcfR objects are in the [data/data_objects](https://
 - `biallelic_distances.rds`: the MIPAnalyzer object from Verity et al. 2020
 - `biallelic_processed_Kenya.rds`: the MIPAnalyzer object from our dataset from Kenya generated in this study.
 - `biallelic_processed_TAN.rds `: the MIPAnalyzer object from our dataset from Zanzibar generated in this study. Metadata is in the [metadata](https://github.com/sconnelly007/TAN_MIP/tree/main/data/metadata) directory.
-- `vcf_nomiss.vcf.gz`: the vcfR object from our dataset from Zanzibar generated in this study. This vcf was filtered to targeted sites, by sample and loci missingness, and on minor and major allele frequency. Metadata is in the [metadata](https://github.com/sconnelly007/TAN_MIP/tree/main/data/metadata) directory.
+- `vcf_nomiss.vcf.gz`: the vcf from our dataset from Zanzibar generated in this study. This vcf was filtered to targeted sites, by sample and loci missingness, and on minor and major allele frequency. Metadata is in the [metadata](https://github.com/sconnelly007/TAN_MIP/tree/main/data/metadata) directory.
 
 
 The R scripts are in the [R](https://github.com/sconnelly007/TAN_MIP/tree/main/R) directory. These scripts are organized as follows:
