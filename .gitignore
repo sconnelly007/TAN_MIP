@@ -7,7 +7,7 @@
 .Rhistory
 .Rapp.history
 .Rproj.user
-
+.gitignore
 # Session Data files
 .RData
 
@@ -21,8 +21,9 @@ ignore/
 results/
 sharepoint/
 R/DR2_Analysis/archive
+R/DR2_Analysis/00_DR_Analysis_rev.Rmd
 R/IBD/archive
-
+R/DR2_Analysis/
 # RStudio files
 .Rproj.user/
 
