@@ -1,6 +1,7 @@
 # Strong isolation by distance and evidence of population microstructure reflect ongoing Plasmodium falciparum transmission in Zanzibar
 
-This repository is for the manuscript entitled ["Strong isolation by distance and evidence of population microstructure reflect ongoing Plasmodium falciparum transmission in Zanzibar"](https://elifesciences.org/reviewed-preprints/90173).
+This repository is for the manuscript:
+- Sean V. Connelly, Nicholas F. Brazeau, Mwinyi Msellem, Billy E. Ngasala, Ozkan Aydemir, Varun Goel, Karamoko Niaré, David J. Giesbrecht, Zachary R. Popkin-Hall, Christopher M. Hennelly, Zackary Park, Ann M. Moormann, John Michael Ong'echa, Robert Verity, Safia Mohammed, Shija J. Shija, Lwidiko E. Mhamilawa, Ulrika Morris, Andreas Märtensson, Jessica T. Lin, Anders Björkman, Jonathan J. Juliano, Jeffrey A. Bailey (2023) [Strong isolation by distance and evidence of population microstructure reflect ongoing Plasmodium falciparum transmission in Zanzibar](https://elifesciences.org/reviewed-preprints/90173) eLife 12:RP90173 .
 
 The MIPAnalyzer objects and vcfR objects are in the [data/data_objects](https://github.com/sconnelly007/TAN_MIP/tree/main/data/data_objects) directory. These objects are organized as follows:
 - `biallelic_distances.rds`: the MIPAnalyzer object from Verity et al. 2020
